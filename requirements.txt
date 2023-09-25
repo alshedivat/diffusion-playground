@@ -1,0 +1,11 @@
+einops
+matplotlib
+numpy
+pytorch-lightning
+scikit-learn
+seaborn
+torch
+torchdiffeq
+torchvision
+tqdm
+wandb
