@@ -25,10 +25,6 @@ class Denoiser(abc.ABC, torch.nn.Module):
         self.model = model
         self.sigma_data = sigma_data
 
-    @property
-    def input_dim(self):
-        return self.model.input_dim
-
     @abc.abstractmethod
     def forward(self, input, sigma, **kwargs):
         """Computes the denoised output for a given input and noise level.

@@ -445,6 +445,7 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
 
 
 def sample(
+    input_shape: tuple[int, ...],
     ode: BaseDiffEq,
     solver: BaseDiffEqSolver,
     noise_schedule: BaseNoiseSchedule,
@@ -462,8 +463,10 @@ def sample(
         raise ValueError(f"Unknown ODE type: {type(ode)}")
 
     # Generate a batch of initial noise.
-    input_dim = ode.denoiser.input_dim
-    y0 = sigma0 * torch.randn([batch_size, input_dim], device=device)
+    y0 = sigma0 * torch.randn((batch_size,) + input_shape, device=device)
+
+    # Transfer denosing model to the specified device.
+    ode.denoiser.to(device)
 
     # Run solver.
     trajectory = solver.solve(x, y0, ode)
