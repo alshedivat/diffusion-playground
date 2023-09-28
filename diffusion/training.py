@@ -3,7 +3,7 @@ import abc
 import copy
 import functools
 import math
-from typing import Callable
+from typing import Any, Callable
 
 import pytorch_lightning as pl
 import torch
@@ -273,7 +273,11 @@ class DiffusionModel(pl.LightningModule):
         loss_fn: BaseLossFn,
         sigma_sampler: BaseSigmaSampler,
         ema_schedule: EMAWarmupSchedule,
-        learning_rate: float,
+        optimizer_cls: type[torch.optim.Optimizer],
+        optimizer_kwargs: dict[str, Any],
+        lr_scheduler_cls: type[torch.optim.lr_scheduler._LRScheduler] | None = None,
+        lr_scheduler_kwargs: dict[str, Any] | None = None,
+        lr_scheduler_monitor: str = "train_loss",
     ):
         super().__init__()
 
@@ -286,21 +290,40 @@ class DiffusionModel(pl.LightningModule):
         self.sigma_sampler = sigma_sampler
         self.ema_schedule = ema_schedule
 
-        # Save other hyperparameters.
-        self.learning_rate = learning_rate
+        # Save optimization parameters.
+        self._optimizer_builder = functools.partial(optimizer_cls, **optimizer_kwargs)
+        if lr_scheduler_cls is None:
+            self._lr_scheduler_builder = lambda _: None
+        else:
+            self._lr_scheduler_builder = functools.partial(
+                lr_scheduler_cls, **(lr_scheduler_kwargs or {})
+            )
+        self._lr_scheduler_monitor = lr_scheduler_monitor
 
     def forward(self, input, sigma, **model_kwargs):
         return self.model_ema(input, sigma, **model_kwargs)
 
     # --- PyTroch Lightning methods: start ------------------------------------
 
+    @property
+    def current_lr(self) -> float:
+        optimizer = self.optimizers()
+        return optimizer.optimizer.param_groups[0]["lr"]
+
     def configure_optimizers(self):
-        # TODO: add support for different optimizers and learning rate schedules.
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = self._optimizer_builder(self.parameters())
+        lr_scheduler = self._lr_scheduler_builder(optimizer)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": lr_scheduler,
+            "monitor": self._lr_scheduler_monitor,
+        }
 
     def optimizer_step(self, *args, **kwargs):
         """Updates model parameters and EMA model parameters."""
         super().optimizer_step(*args, **kwargs)
+        # Log learning rate.
+        self.log("lr", self.current_lr, prog_bar=True)
         # Update EMA model.
         ema_decay = self.ema_schedule.get_value()
         ema_update(self.model, self.model_ema, ema_decay)
