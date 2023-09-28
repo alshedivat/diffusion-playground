@@ -201,9 +201,10 @@ class KarrasDiffEq(BaseDiffEq):
 
         # Compute sigma and d sigma / dt for each time point in the batch.
         # NOTE: we assume that sigma_fn is an element-wise function.
-        t = x.repeat(batch_size, 1).detach().requires_grad_()  # shape: [batch_size, 1]
-        sigma = self.x_to_sigma(t)  # shape: [batch_size, 1]
-        dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1]
+        t = x.repeat(batch_size).detach().requires_grad_()  # shape: [batch_size]
+        t = utils.expand_dims(t, y.ndim)  # shape: [batch_size, 1, ...]
+        sigma = self.x_to_sigma(t)  # shape: [batch_size, 1, ...]
+        dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1, ...]
 
         # Compute dy/dx.
         with torch.inference_mode():
