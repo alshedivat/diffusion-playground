@@ -1,7 +1,16 @@
 """Denoising diffusion model for MNIST.
 
-Most of the model code is copied verbatim (up to formatting) from:
-https://github.com/NVlabs/edm/blob/main/training/networks.py.
+All the code below is copied verbatim (up to formatting) from:
+https://github.com/NVlabs/edm/blob/62072d2612c7da05165d6233d13d17d71f213fee/training/networks.py.
+
+The code in this file is licensed under CC BY-NC-SA 4.0:
+|
+| Copyright (c) 2022, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+|
+| This work is licensed under a Creative Commons
+| Attribution-NonCommercial-ShareAlike 4.0 International License.
+| You should have received a copy of the license along with this
+| work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/.
 """
 import numpy as np
 import torch

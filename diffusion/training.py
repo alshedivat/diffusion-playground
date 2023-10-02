@@ -168,6 +168,9 @@ class LogNormalNoiseSampler(BaseSigmaSampler):
 # -----------------------------------------------------------------------------
 # Exponential moving average (EMA) update for model parameters.
 # -----------------------------------------------------------------------------
+# EMA code is copied with modification from: https://github.com/crowsonkb/k-diffusion.
+# The original code is made available by Katherine Crowson under the MIT license.
+# -----------------------------------------------------------------------------
 
 
 @torch.inference_mode()
@@ -193,8 +196,6 @@ def ema_update(model, model_ema, decay):
 
 class EMAWarmupSchedule:
     """Implements an EMA warmup using an inverse decay schedule.
-
-    Source: https://github.com/crowsonkb/k-diffusion.
 
     If inv_gamma=1 and power=1, implements a simple average. inv_gamma=1, power=2/3 are
     good values for models you plan to train for a million or more steps (reaches decay
