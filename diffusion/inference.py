@@ -251,14 +251,50 @@ class LogSnrDiffEq(BaseDiffEq):
 
 
 class BaseDiffEqSolver(abc.ABC):
-    """Abstract base class for ODE solvers."""
+    """Abstract base class for ODE solvers.
+
+    Subclasses must implement _solve method. This class wraps _solve and takes
+    care of the last step of the trajectory, which requires special handling
+    when sigma = 0: the dy_dx derivative is not defined at sigma = 0, so we
+    use Euler method for the last step, as proposed by Karras et al. (2022).
+    """
+
+    def _euler_step(self, x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
+        """Computes Euler step."""
+        dy_dx = ode.dy_dx(x, y)
+        return y + dy_dx * dx
 
     @abc.abstractmethod
-    def solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
-        """Integrates the specified spcified ODE over x and returns the y trajectory.
+    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+        """Implements integration of the specified spcified ODE over x and returns the y trajectory.
 
         Must be implemented by subclasses.
         """
+
+    def solve(
+        self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool | None = None
+    ) -> Tensor:
+        """Integrates the specified spcified ODE over x and returns the y trajectory."""
+        # If the last step of the trajectory corresponds to sigma = 0, use Euler method for the last step.
+        if euler_last_step is None:
+            sigma_last = ode.x_to_sigma(x[-1]).item()
+            euler_last_step = sigma_last == 0
+
+        # Preapre x pairs for iteration.
+        if euler_last_step:
+            x, x_last_pair = x[:-1], (x[-2], x[-1])
+
+        # Run integration.
+        trajectory = self._solve(x, y0, ode)
+
+        # Special case the last step.
+        if euler_last_step:
+            y_last = trajectory[-1]
+            x_i, x_ip1 = x_last_pair
+            y = self._euler_step(x_i, x_ip1 - x_i, y_last, ode)
+            trajectory = torch.cat([trajectory, y.unsqueeze(0)], dim=0)
+
+        return trajectory
 
 
 class TorchDiffEqOdeintSolver(BaseDiffEqSolver):
@@ -273,17 +309,8 @@ class TorchDiffEqOdeintSolver(BaseDiffEqSolver):
         self.method = method
         self.options = options
 
-    def _euler_step(self, x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
-        """Computes Euler step."""
-        dy_dx = ode.dy_dx(x, y)
-        return y + dy_dx * dx
-
-    def solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool = True) -> Tensor:
-        # Preapre x pairs for iteration.
-        if euler_last_step:
-            x, x_last_pair = x[:-1], (x[-2], x[-1])
-
-        # Run integration for all steps but the last one.
+    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+        """Integrates the specified spcified ODE over x and returns the y trajectory."""
         trajectory = odeint(
             func=ode.dy_dx,
             y0=y0,
@@ -293,13 +320,6 @@ class TorchDiffEqOdeintSolver(BaseDiffEqSolver):
             method=self.method,
             options=self.options,
         )
-
-        # If needed, special case the last step, where dy/dx may not be defined if sigma = 0.
-        if euler_last_step:
-            y_last = trajectory[-1]
-            x_i, x_ip1 = x_last_pair
-            y = self._euler_step(x_i, x_ip1 - x_i, y_last, ode)
-            trajectory = torch.cat([trajectory, y.unsqueeze(0)], dim=0)
 
         return trajectory
 
@@ -311,12 +331,6 @@ class KarrasHeun2Solver(BaseDiffEqSolver):
     """
 
     @staticmethod
-    def _euler_step(x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
-        """Computes Euler step."""
-        dy_dx = ode.dy_dx(x, y)
-        return y + dy_dx * dx
-
-    @staticmethod
     def _euler_step_correct(x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
         """Computes Euler step with 2nd order correction."""
         dy_dx = ode.dy_dx(x, y)
@@ -324,27 +338,13 @@ class KarrasHeun2Solver(BaseDiffEqSolver):
         dy_dx_new = ode.dy_dx(x + dx, y + dy_dx * dx)
         return y + 0.5 * (dy_dx + dy_dx_new) * dx
 
-    def solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool = True) -> Tensor:
+    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
         trajectory = [y0]
-
-        # Prepare x pairs for iteration.
-        if euler_last_step:
-            x_pairs = zip(x[:-2], x[1:-1])
-            x_last_pair = x[-2], x[-1]
-        else:
-            x_pairs = zip(x[:-1], x[1:])
-            x_last_pair = None
 
         # Apply Euler step with 2nd order correction.
         y = y0
-        for x_i, x_ip1 in x_pairs:
+        for x_i, x_ip1 in zip(x[:-1], x[1:]):
             y = self._euler_step_correct(x_i, x_ip1 - x_i, y, ode)
-            trajectory.append(y)
-
-        # If needed, special case the last step, where dy/dx may not be defined if sigma = 0.
-        if euler_last_step:
-            x_i, x_ip1 = x_last_pair
-            y = self._euler_step(x_i, x_ip1 - x_i, y, ode)
             trajectory.append(y)
 
         return torch.stack(trajectory, dim=0)
@@ -399,9 +399,10 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
         self.s_min = s_x_min
         self.s_max = s_x_max
 
-    def _inject_noise(
-        self, x: Tensor, y: Tensor, gamma: float, ode: BaseDiffEq
-    ) -> tuple[Tensor, Tensor]:
+        # Placeholders for variables computed during integration.
+        self.gamma = None
+
+    def _inject_noise(self, x: Tensor, y: Tensor, ode: BaseDiffEq) -> tuple[Tensor, Tensor]:
         # Convert x to sigma.
         sigma = ode.x_to_sigma(x)
 
@@ -410,7 +411,7 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
             return x, y
 
         # Inject noise into the current sample (Agorithm 2, lines 5-6).
-        sigma_hat = (1 + gamma) * sigma
+        sigma_hat = (1 + self.gamma) * sigma
         eps = self.s_noise * torch.randn_like(y)
         y_hat = y + torch.sqrt(sigma_hat**2 - sigma**2) * eps
 
@@ -419,16 +420,24 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
 
         return x_hat, y_hat
 
-    def solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _euler_step(self, x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
+        """Computes Euler step after injecting noise."""
+        x_hat, y_hat = self._inject_noise(x, y, ode)
+        dx = dx + x - x_hat  # Adjust dx to account for noise injection.
+        return super()._euler_step(x_hat, dx, y_hat, ode)
+
+    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
         trajectory = [y0]
+
+        # Compute gamma (Algorithm 2, comment next to line 3).
         n_steps = x.shape[0]
-        gamma = min(self.s_churn / n_steps, 2**0.5 - 1)
+        self.gamma = min(self.s_churn / n_steps, 2**0.5 - 1)
 
         # Integrate the SDE over the specified steps.
         y = y0
-        for x_i, x_ip1 in zip(x[:-2], x[1:-1]):
+        for x_i, x_ip1 in zip(x[:-1], x[1:]):
             # Inject noise into the current sample.
-            x_i_hat, y_hat = self._inject_noise(x_i, y, gamma, ode)
+            x_i_hat, y_hat = self._inject_noise(x_i, y, ode)
             # Run the ODE solver to x_ip1.
             y_i_traj = self.ode_solver.solve(
                 x=torch.stack([x_i_hat, x_ip1]),
