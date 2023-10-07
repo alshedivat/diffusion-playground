@@ -45,9 +45,9 @@ def _loss_weighting_min_snr_gamma(sigma, sigma_data, gamma=5.0):
 
 
 def _loss_weighting_soft_min_snr(sigma, sigma_data):
-    """Weighting function based on the soft-min-SNR: SNR / (1 + SNR) ** 2."""
+    """Weighting function based on the soft-min-SNR: 4 * SNR / (1 + SNR) ** 2."""
     snr = (sigma_data / sigma) ** 2
-    return snr / (1 + snr) ** 2
+    return 4 * snr / (1 + snr) ** 2
 
 
 WEIGHTING_SCHEMES = {
