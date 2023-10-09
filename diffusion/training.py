@@ -314,11 +314,14 @@ class DiffusionModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = self._optimizer_builder(self.parameters())
         lr_scheduler = self._lr_scheduler_builder(optimizer)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": lr_scheduler,
-            "monitor": self._lr_scheduler_monitor,
-        }
+        if lr_scheduler is None:
+            return optimizer
+        else:
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": lr_scheduler,
+                "monitor": self._lr_scheduler_monitor,
+            }
 
     def optimizer_step(self, *args, **kwargs):
         """Updates model parameters and EMA model parameters."""

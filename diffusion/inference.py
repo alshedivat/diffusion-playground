@@ -1,7 +1,9 @@
 """Utility functions for running inference for diffusion models."""
 import abc
+from collections import deque
 from typing import Callable
 
+import sympy
 import torch
 from torchdiffeq import odeint
 
@@ -350,15 +352,201 @@ class KarrasHeun2Solver(BaseDiffEqSolver):
         return torch.stack(trajectory, dim=0)
 
 
-class DPMSolver(BaseDiffEqSolver):
-    """Implments DPM-solver from Lu et al. (2022).
+class DPMppDiffEqSolver(BaseDiffEqSolver):
+    """Implments DPM-Solver++ for diffusion ODE from Lu et al. (2022).
+
+    This solver exploits the semi-linear structure of the diffusion ODE
+    and does the following:
+        1)  changes variables and converts ODE to the log-SNR domain,
+        2)  analytically integrates the linear part of the ODE,
+        3)  uses Taylor expansion of 1st, 2nd, or 3rd order to approximate
+            the non-linear part of the ODE.
+
+    DPM-Solver++ is not a black-box solver and requires knowing the exact form of the ODE.
+    Here, we implement the solver for LogSnrDiffEq, which is the log-SNR version of
+    the diffusion ODE from Karras et al. (2022):
+        dy/dx = (D(y, sigma(x)) - y) / 2,
+        where x is defined as log-SNR: x := 2 log(sigma_data / sigma).
+
+    The solution of this ODE when integrating from x1 to x2 is given by:
+        y(x2) = exp((x1 - x2)/2) * y(x1) +
+                (1/2) * int_{x1}^{x2} exp((x - x2)/2) D(y(x), sigma(x)) dx.
+
+    The integral is approximated by K terms of Taylor expansion:
+        sum_{n=0}^{k-1} D^n(y(x1), sigma(x1)) * I(n),
+        where I(n) := int_{x1}^{x2} exp((x - x2)/2) (x - x1)^n / n! dx,
+        and D^n(y(x1), sigma(x1)) is the n-th derivative of D(y, sigma) at x1.
+
+    The integral I(n) can be computed analytically (in the code, we compute them using sympy).
+    And the derivatives D^n(y(x1), sigma(x1)) is computed using single-step or multi-step
+    methods as proposed in the paper by Lu et al. (2022).
+
+    NOTE: our implementation differs from the original one in the following ways:
+        - we define log-SNR as `2 log(sigma_data / sigma)` instead of `log(sigma_data / sigma)`,
+        - the ODE we are solving is the log-SNR of the Karras et al. (2022) ODE,
+        - we use sympy for computing Taylor expansion coefficients automatically.
+    As a result, the math in our code is sligtly different and the overall implementation
+    turns out to be much simpler and more readable.
 
     References:
-        - DPM-solver: https://arxiv.org/abs/2206.00927.
-        - DPM-solver++: https://arxiv.org/abs/2211.01095.
+        - DPM-Solver: https://arxiv.org/abs/2206.00927.
+        - DPM-Solver++: https://arxiv.org/abs/2211.01095.
+        - Original code: https://github.com/LuChengTHU/dpm-solver.
     """
 
-    # TODO
+    def __init__(
+        self, order: int = 2, multistep: bool = True, lower_order_final: bool = True
+    ) -> None:
+        self.order = order
+        self.multistep = multistep
+        self.lower_order_final = lower_order_final
+
+        # Pre-compute expressions for I(n) coefficients in the Taylor expansion
+        # of the non-linear part of the ODE solution.
+        self._taylor_coeffs = self._compute_taylor_coeff_exprs()
+
+    def _compute_taylor_coeff_exprs(self) -> list[sympy.Expr]:
+        """Computes Taylor expansion coefficients for the specified order using sympy."""
+        taylor_coeffs = {"vars": {}, "exprs": []}
+
+        # Define symbols.
+        x, x1, x2 = sympy.symbols("x x1 x2")
+        taylor_coeffs["vars"]["x1"] = x1
+        taylor_coeffs["vars"]["x2"] = x2
+
+        # Compute Taylor expansion coefficients.
+        for n in range(self.order):
+            I_expr = sympy.integrate(
+                sympy.exp((x - x2) / 2) * (x - x1) ** n / sympy.factorial(n), (x, x1, x2)
+            )
+            taylor_coeffs["exprs"].append(I_expr)
+
+        return taylor_coeffs
+
+    @staticmethod
+    def _compute_denoised(x: Tensor, y: Tensor, ode: LogSnrDiffEq) -> Tensor:
+        """Computes denoised y value at the specified x value."""
+        assert x.numel() == 1, "_compute_denoised expects a single x value as input."
+        batch_size = y.shape[0]
+
+        # Compute sigma from log-SNR.
+        sigma = ode.x_to_sigma(x).repeat(batch_size)
+
+        return ode.denoiser(y, sigma)
+
+    def _solve(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
+        """Depending on the settings, calls either single-step or multi-step method."""
+        if self.multistep:
+            return self._solve_multistep(x, y0, ode)
+        else:
+            return self._solve_singlestep(x, y0, ode)
+
+    @torch.inference_mode()
+    def solve(
+        self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool | None = None
+    ) -> Tensor:
+        """Sanity checks that ODE is LogSnrDiffEq and calls sovle from the parent class."""
+        if not isinstance(ode, LogSnrDiffEq):
+            raise ValueError("DPMppDiffEqSolver can only be used to solve LogSnrDiffEq.")
+        return super().solve(x, y0, ode, euler_last_step)
+
+    # --- Multi-step method ---------------------------------------------------
+
+    @staticmethod
+    def _compute_multistep_denoiser_derivatives(
+        x_d_buffer: deque, order: int
+    ) -> tuple[Tensor, ...]:
+        """Computes derivatives of the denoiser at the specified order using multi-step method."""
+        if order == 1:
+            # Already computed denoised value is the 0-th order derivative.
+            _, d1 = x_d_buffer[0]
+            return (d1,)
+        elif order == 2:
+            x1, d1 = x_d_buffer[0]
+            x0, d0 = x_d_buffer[1]
+            # Compute first order derivative.
+            dd1 = (d1 - d0) / (x1 - x0)
+            return d1, dd1
+        elif order == 3:
+            x1, d1 = x_d_buffer[0]
+            x0, d0 = x_d_buffer[1]
+            xm1, dm1 = x_d_buffer[2]
+            # Compute first order derivatives at x1 and x0.
+            dd1_1 = (d1 - d0) / (x1 - x0)
+            dd1_0 = (d0 - dm1) / (x0 - xm1)
+            # Compute first order derivative using a 3-point formula.
+            # NOTE: formula copied from the original implementation; double check derivation.
+            dd1 = dd1_1 + (dd1_1 - dd1_0) * (x1 - x0) / (x1 - xm1)
+            # Compute second order derivative.
+            d2d1 = (dd1_1 - dd1_0) / (x1 - xm1)
+            return d1, dd1, d2d1
+        else:
+            raise ValueError(f"Unsupported order: {order}.")
+
+    def _compute_multistep_update(
+        self, x: Tensor, y: Tensor, x_d_buffer: deque[tuple[Tensor, Tensor]], order: int
+    ):
+        """Computes DPM-Solver++ update of the specified order."""
+        # Rename variables to match our notation.
+        x1, _ = x_d_buffer[0]  # The first element in the buffer is the most recent one.
+        x2, y1 = x, y
+
+        # Compute the linear part of the update: exp((x1 - x2)/2) * y(x1).
+        y2 = torch.exp((x1 - x2) / 2) * y1
+
+        # Compute the non-linear part of the update.
+        d_derivatives = self._compute_multistep_denoiser_derivatives(x_d_buffer, order=order)
+        for n in range(order):
+            # Compute values for the Taylor coefficients using sympy.
+            coeff_i = self._taylor_coeffs["exprs"][n].subs(
+                {
+                    self._taylor_coeffs["vars"]["x1"]: x1.item(),
+                    self._taylor_coeffs["vars"]["x2"]: x2.item(),
+                }
+            )
+            y2 += float(coeff_i) * d_derivatives[n] / 2
+
+        return y2
+
+    def _solve_multistep(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
+        # Sanity check.
+        n_steps = x.shape[0]
+        if n_steps < self.order:
+            raise ValueError(
+                f"Number of steps must be at least {self.order} for the multi-step method."
+            )
+
+        # Initialize circular buffers for the specified order of the multistep solver.
+        x_d_buffer = deque(maxlen=self.order)
+        x_i, d_i = x[0], self._compute_denoised(x[0], y0, ode=ode)
+        x_d_buffer.appendleft((x_i, d_i))
+
+        # Run integration.
+        trajectory = [y0]
+        y_i = y0
+        for n in range(1, n_steps):
+            if n < self.order:
+                # Use lower order method for the first few steps.
+                order = n
+            elif self.lower_order_final and n_steps < 10:
+                # Use lower order method for the last few steps if total number of steps < 10.
+                # This trick is important for stabilizing sampling with very few steps.
+                order = min(self.order, n_steps - n)
+            else:
+                order = self.order
+            x_i = x[n]
+            y_i = self._compute_multistep_update(x_i, y_i, x_d_buffer, order=order)
+            d_i = self._compute_denoised(x_i, y_i, ode=ode)
+            x_d_buffer.appendleft((x_i, d_i))
+            trajectory.append(y_i)
+
+        return torch.stack(trajectory, dim=0)
+
+    # --- Single-step method --------------------------------------------------
+
+    def _solve_singlestep(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
+        # TODO: implement single-step method.
+        raise NotImplementedError("Single-step method is not implemented yet.")
 
 
 # -----------------------------------------------------------------------------

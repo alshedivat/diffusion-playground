@@ -4,6 +4,7 @@ numpy
 pytorch-lightning
 scikit-learn
 seaborn
+sympy
 torch
 torchdiffeq
 torchvision
