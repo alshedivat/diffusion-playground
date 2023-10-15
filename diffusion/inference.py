@@ -368,17 +368,17 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         dy/dx = (D(y, sigma(x)) - y) / 2,
         where x is defined as log-SNR: x := 2 log(sigma_data / sigma).
 
-    The solution of this ODE when integrating from x1 to x2 is given by:
-        y(x2) = exp((x1 - x2)/2) * y(x1) +
-                (1/2) * int_{x1}^{x2} exp((x - x2)/2) D(y(x), sigma(x)) dx.
+    The solution of this ODE when integrating from x_1 to x_2 is given by:
+        y(x2) = exp((x_1 - x_2)/2) * y(x_1) +
+                (1/2) * int_{x_1}^{x_2} exp((x - x_2)/2) D(y(x), sigma(x)) dx.
 
     The integral is approximated by K terms of Taylor expansion:
-        sum_{n=0}^{k-1} D^n(y(x1), sigma(x1)) * I(n),
-        where I(n) := int_{x1}^{x2} exp((x - x2)/2) (x - x1)^n / n! dx,
-        and D^n(y(x1), sigma(x1)) is the n-th derivative of D(y, sigma) at x1.
+        sum_{n=0}^{k-1} D^n(y(x_1), sigma(x_1)) * I(n),
+        where I(n) := int_{x_1}^{x_2} exp((x - x_2)/2) (x - x_1)^n / n! dx,
+        and D^n(y(x1), sigma(x1)) is the n-th derivative of D(y, sigma) at x_1.
 
     The integral I(n) can be computed analytically (in the code, we compute them using sympy).
-    And the derivatives D^n(y(x1), sigma(x1)) is computed using single-step or multi-step
+    And the derivatives D^n(y(x_1), sigma(x_1)) is computed using single-step or multi-step
     methods as proposed in the paper by Lu et al. (2022).
 
     NOTE: our implementation differs from the original one in the following ways:
@@ -427,14 +427,14 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         taylor_coeffs = {"vars": {}, "exprs": []}
 
         # Define symbols.
-        x, x1, x2 = sympy.symbols("x x1 x2")
-        taylor_coeffs["vars"]["x1"] = x1
-        taylor_coeffs["vars"]["x2"] = x2
+        x, x_1, x_2 = sympy.symbols("x x_1 x_2")
+        taylor_coeffs["vars"]["x_1"] = x_1
+        taylor_coeffs["vars"]["x_2"] = x_2
 
         # Compute Taylor expansion coefficients.
         for n in range(self.order):
             I_expr = sympy.integrate(
-                sympy.exp((x - x2) / 2) * (x - x1) ** n / sympy.factorial(n), (x, x1, x2)
+                sympy.exp((x - x_2) / 2) * (x - x_1) ** n / sympy.factorial(n), (x, x_1, x_2)
             )
             taylor_coeffs["exprs"].append(I_expr)
 
@@ -474,40 +474,39 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         """Computes derivatives of the denoiser at the specified order."""
         if order == 1:
             # Already computed denoised value is the 0-th order derivative.
-            _, d1 = x_d_buffer[0]
-            return (d1,)
+            _, d_1 = x_d_buffer[0]
+            return (d_1,)
         elif order == 2:
-            x1, d1 = x_d_buffer[0]
-            x0, d0 = x_d_buffer[1]
+            x_1, d_1 = x_d_buffer[0]
+            x_0, d_0 = x_d_buffer[1]
             # Compute first order derivative.
-            dd1 = (d1 - d0) / (x1 - x0)
-            return d1, dd1
+            dd_1 = (d_1 - d_0) / (x_1 - x_0)
+            return d_1, dd_1
         elif order == 3:
-            x1, d1 = x_d_buffer[0]
-            x0, d0 = x_d_buffer[1]
-            xm1, dm1 = x_d_buffer[2]
+            x_1, d_1 = x_d_buffer[0]
+            x_0, d_0 = x_d_buffer[1]
+            x_m1, d_m1 = x_d_buffer[2]
             # Compute first order derivatives at x1 and x0.
-            dd1_1 = (d1 - d0) / (x1 - x0)
-            dd1_0 = (d0 - dm1) / (x0 - xm1)
+            dd1_1 = (d_1 - d_0) / (x_1 - x_0)
+            dd1_0 = (d_0 - d_m1) / (x_0 - x_m1)
             # Compute first order derivative using a 3-point formula.
             # NOTE: formula copied from the original implementation; double check derivation.
-            dd1 = dd1_1 + (dd1_1 - dd1_0) * (x1 - x0) / (x1 - xm1)
+            dd_1 = dd1_1 + (dd1_1 - dd1_0) * (x_1 - x_0) / (x_1 - x_m1)
             # Compute second order derivative.
-            d2d1 = (dd1_1 - dd1_0) / (x1 - xm1)
-            return d1, dd1, d2d1
+            d2d_1 = (dd1_1 - dd1_0) / (x_1 - x_m1)
+            return d_1, dd_1, d2d_1
         else:
             raise ValueError(f"Unsupported order: {order}.")
 
     def _compute_update(
-        self, x: Tensor, y: Tensor, x_d_buffer: deque[tuple[Tensor, Tensor]], order: int
+        self, x_2: Tensor, y_1: Tensor, x_d_buffer: deque[tuple[Tensor, Tensor]], order: int
     ):
         """Computes DPM-Solver++ update of the specified order."""
-        # Rename variables to match our notation.
-        x1, _ = x_d_buffer[0]  # The first element in the buffer is the most recent one.
-        x2, y1 = x, y
+        # The first element in the buffer is the most recent one.
+        x_1, _ = x_d_buffer[0]
 
-        # Compute the linear part of the update: exp((x1 - x2)/2) * y(x1).
-        y2 = torch.exp((x1 - x2) / 2) * y1
+        # Compute the linear part of the update: exp((x_1 - x_2)/2) * y(x_1).
+        y_2 = torch.exp((x_1 - x_2) / 2) * y_1
 
         # Compute the non-linear part of the update.
         d_derivatives = self._compute_denoiser_derivatives(x_d_buffer, order=order)
@@ -515,13 +514,13 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
             # Compute values for the Taylor coefficients using sympy.
             coeff_i = self._taylor_coeffs["exprs"][n].subs(
                 {
-                    self._taylor_coeffs["vars"]["x1"]: x1.item(),
-                    self._taylor_coeffs["vars"]["x2"]: x2.item(),
+                    self._taylor_coeffs["vars"]["x_1"]: x_1.item(),
+                    self._taylor_coeffs["vars"]["x_2"]: x_2.item(),
                 }
             )
-            y2 += float(coeff_i) * d_derivatives[n] / 2
+            y_2 += float(coeff_i) * d_derivatives[n] / 2
 
-        return y2
+        return y_2
 
     # --- Multi-step method ---------------------------------------------------
 
@@ -541,7 +540,7 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
         # Run integration.
         trajectory = [y0]
-        y_n = y0
+        y_nm1 = y0
         for n in range(1, n_steps):
             if n < self.order:
                 # Use lower order method for the first few steps.
@@ -553,10 +552,11 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
             else:
                 order = self.order
             x_n = x[n]
-            y_n = self._compute_update(x_n, y_n, x_d_buffer, order=order)
+            y_n = self._compute_update(x_n, y_nm1, x_d_buffer, order=order)
             d_n = self._compute_denoised(x_n, y_n, ode=ode)
             x_d_buffer.appendleft((x_n, d_n))
             trajectory.append(y_n)
+            y_nm1 = y_n
 
         return torch.stack(trajectory, dim=0)
 
@@ -573,6 +573,10 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         Returns:
             A new tensor with interpolated steps.
         """
+        # Edge case optimization.
+        if k < 1:
+            return x
+
         n_steps = x.shape[0]
 
         # Calculate the total length of the new tensor
@@ -597,19 +601,21 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
         return new_x
 
-    def _compute_singlestep_update(
-        self, xs: Tensor, y: Tensor, ode: LogSnrDiffEq, order: int
-    ) -> Tensor:
+    def _compute_singlestep_update(self, xs: Tensor, y: Tensor, ode: LogSnrDiffEq) -> Tensor:
         """Computes DPM-Solver++ update of the specified order using sigle-step method."""
+        # Infer order from the provided sequnece of steps.
+        order = xs.shape[0] - 1
+
         # Intitialize circular buffer for the specified order of the single-step solver.
         x_d_buffer = deque(maxlen=order)
 
         # Run integration for intermediate steps.
         y_n = y
         for n in range(order):
-            x_n, d_n = xs[n], self._compute_denoised(xs[n], y_n, ode=ode)
+            x_n, x_np1 = xs[n], xs[n + 1]
+            d_n = self._compute_denoised(x_n, y_n, ode=ode)
             x_d_buffer.appendleft((x_n, d_n))
-            y_n = self._compute_update(xs[n], y_n, x_d_buffer, order=(n + 1))
+            y_n = self._compute_update(x_np1, y_n, x_d_buffer, order=(n + 1))
 
         return y_n
 
@@ -623,17 +629,21 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
                 "unless add_intermediate_single_steps is True."
             )
 
-        # Add intermediate steps, if necessary.
+        # Add (order - 1) intermediate steps, if necessary.
         if self.add_intermediate_single_steps:
-            x = self._add_intermediate_steps(x, k=self.order)
+            x = self._add_intermediate_steps(x, k=self.order - 1)
             n_steps = x.shape[0]
 
         # Run integration.
         trajectory = [y0]
         y_n = y0
-        for n in range(0, n_steps, self.order):
-            xs_n = x[n : (n + self.order)]
-            y_n = self._compute_singlestep_update(xs_n, y_n, ode=ode, order=self.order)
+        for n in range(0, n_steps - 1, self.order):
+            # Select a sub-sequence of steps of length (order + 1):
+            # the first and last elements correspond to the current and the next steps,
+            # and the remaining (order - 1) elements are intermediate steps used to compute
+            # higher-order derivatives of the denoiser.
+            xs_n = x[n : (n + self.order + 1)]
+            y_n = self._compute_singlestep_update(xs_n, y_n, ode=ode)
             trajectory.append(y_n)
 
         return torch.stack(trajectory, dim=0)
