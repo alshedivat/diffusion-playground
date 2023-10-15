@@ -384,9 +384,21 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
     NOTE: our implementation differs from the original one in the following ways:
         - we define log-SNR as `2 log(sigma_data / sigma)` instead of `log(sigma_data / sigma)`,
         - the ODE we are solving is the log-SNR of the Karras et al. (2022) ODE,
-        - we use sympy for computing Taylor expansion coefficients automatically.
+        - we use sympy for computing Taylor expansion coefficients automatically,
+        - we use Euler method for the last step of integration when sigma = 0.
     As a result, the math in our code is sligtly different and the overall implementation
     turns out to be much simpler and more readable.
+
+    Args:
+        order: The order of the Taylor expansion used to approximate the non-linear part of the ODE.
+        multistep: Whether to use multi-step method for computing derivatives of the denoiser.
+            If False, uses single-step method. The only difference is that multi-step method
+            re-uses previous steps in the trajectory for computing higher-oder derivatives at the
+            current step; single-step computes all derivatives from scratch using intermediate points.
+        lower_order_final: Whether to use lower order method for the last few steps of integration.
+        add_intermediate_single_steps: Whether to add intermediate steps when using single-step method.
+            If False, uses some of the provided steps as intermediate points during integration,
+            otherwise adds intermediate points between the provided steps, resulting in higher compute cost.
 
     References:
         - DPM-Solver: https://arxiv.org/abs/2206.00927.
@@ -395,11 +407,16 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
     """
 
     def __init__(
-        self, order: int = 2, multistep: bool = True, lower_order_final: bool = True
+        self,
+        order: int = 2,
+        multistep: bool = True,
+        lower_order_final: bool = True,
+        add_intermediate_single_steps: bool = False,
     ) -> None:
         self.order = order
         self.multistep = multistep
         self.lower_order_final = lower_order_final
+        self.add_intermediate_single_steps = add_intermediate_single_steps
 
         # Pre-compute expressions for I(n) coefficients in the Taylor expansion
         # of the non-linear part of the ODE solution.
@@ -450,13 +467,11 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
             raise ValueError("DPMppDiffEqSolver can only be used to solve LogSnrDiffEq.")
         return super().solve(x, y0, ode, euler_last_step)
 
-    # --- Multi-step method ---------------------------------------------------
+    # --- Common methods ------------------------------------------------------
 
     @staticmethod
-    def _compute_multistep_denoiser_derivatives(
-        x_d_buffer: deque, order: int
-    ) -> tuple[Tensor, ...]:
-        """Computes derivatives of the denoiser at the specified order using multi-step method."""
+    def _compute_denoiser_derivatives(x_d_buffer: deque, order: int) -> tuple[Tensor, ...]:
+        """Computes derivatives of the denoiser at the specified order."""
         if order == 1:
             # Already computed denoised value is the 0-th order derivative.
             _, d1 = x_d_buffer[0]
@@ -483,7 +498,7 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         else:
             raise ValueError(f"Unsupported order: {order}.")
 
-    def _compute_multistep_update(
+    def _compute_update(
         self, x: Tensor, y: Tensor, x_d_buffer: deque[tuple[Tensor, Tensor]], order: int
     ):
         """Computes DPM-Solver++ update of the specified order."""
@@ -495,7 +510,7 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         y2 = torch.exp((x1 - x2) / 2) * y1
 
         # Compute the non-linear part of the update.
-        d_derivatives = self._compute_multistep_denoiser_derivatives(x_d_buffer, order=order)
+        d_derivatives = self._compute_denoiser_derivatives(x_d_buffer, order=order)
         for n in range(order):
             # Compute values for the Taylor coefficients using sympy.
             coeff_i = self._taylor_coeffs["exprs"][n].subs(
@@ -508,7 +523,10 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
         return y2
 
+    # --- Multi-step method ---------------------------------------------------
+
     def _solve_multistep(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
+        """Computes the solution of the specified ODE using multi-step method."""
         # Sanity check.
         n_steps = x.shape[0]
         if n_steps < self.order:
@@ -518,12 +536,12 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
         # Initialize circular buffers for the specified order of the multistep solver.
         x_d_buffer = deque(maxlen=self.order)
-        x_i, d_i = x[0], self._compute_denoised(x[0], y0, ode=ode)
-        x_d_buffer.appendleft((x_i, d_i))
+        x_n, d_n = x[0], self._compute_denoised(x[0], y0, ode=ode)
+        x_d_buffer.appendleft((x_n, d_n))
 
         # Run integration.
         trajectory = [y0]
-        y_i = y0
+        y_n = y0
         for n in range(1, n_steps):
             if n < self.order:
                 # Use lower order method for the first few steps.
@@ -534,19 +552,91 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
                 order = min(self.order, n_steps - n)
             else:
                 order = self.order
-            x_i = x[n]
-            y_i = self._compute_multistep_update(x_i, y_i, x_d_buffer, order=order)
-            d_i = self._compute_denoised(x_i, y_i, ode=ode)
-            x_d_buffer.appendleft((x_i, d_i))
-            trajectory.append(y_i)
+            x_n = x[n]
+            y_n = self._compute_update(x_n, y_n, x_d_buffer, order=order)
+            d_n = self._compute_denoised(x_n, y_n, ode=ode)
+            x_d_buffer.appendleft((x_n, d_n))
+            trajectory.append(y_n)
 
         return torch.stack(trajectory, dim=0)
 
     # --- Single-step method --------------------------------------------------
 
+    @staticmethod
+    def _add_intermediate_steps(x: Tensor, k: int):
+        """Interpolates steps between the provided ones.
+
+        Args:
+            x: a 1D tensor that contains a sequence of steps.
+            k: number of intermediate points to insert between each pair of steps.
+
+        Returns:
+            A new tensor with interpolated steps.
+        """
+        n_steps = x.shape[0]
+
+        # Calculate the total length of the new tensor
+        n_steps_new = n_steps + (n_steps - 1) * k
+
+        # Create a new tensor to store the interpolated values
+        new_x = torch.zeros(n_steps_new)
+
+        for i in range(n_steps - 1):
+            start_value = x[i]
+            end_value = x[i + 1]
+
+            # Calculate the step for interpolation
+            step = (end_value - start_value) / (k + 1)
+
+            # Insert values into the new tensor
+            for j in range(k + 1):
+                new_x[i * (k + 1) + j] = start_value + j * step
+
+        # Ensure that the last element of the original tensor is in the new tensor.
+        new_x[-1] = x[-1]
+
+        return new_x
+
+    def _compute_singlestep_update(
+        self, xs: Tensor, y: Tensor, ode: LogSnrDiffEq, order: int
+    ) -> Tensor:
+        """Computes DPM-Solver++ update of the specified order using sigle-step method."""
+        # Intitialize circular buffer for the specified order of the single-step solver.
+        x_d_buffer = deque(maxlen=order)
+
+        # Run integration for intermediate steps.
+        y_n = y
+        for n in range(order):
+            x_n, d_n = xs[n], self._compute_denoised(xs[n], y_n, ode=ode)
+            x_d_buffer.appendleft((x_n, d_n))
+            y_n = self._compute_update(xs[n], y_n, x_d_buffer, order=(n + 1))
+
+        return y_n
+
     def _solve_singlestep(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
-        # TODO: implement single-step method.
-        raise NotImplementedError("Single-step method is not implemented yet.")
+        """Computes the solution of the specified ODE using single-step method."""
+        # Sanity check.
+        n_steps = x.shape[0]
+        if n_steps < self.order and not self.add_intermediate_single_steps:
+            raise ValueError(
+                f"Number of steps must be at least {self.order} for the single-step method "
+                "unless add_intermediate_single_steps is True."
+            )
+
+        # Add intermediate steps, if necessary.
+        if self.add_intermediate_single_steps:
+            x = self._add_intermediate_steps(x, k=self.order)
+            n_steps = x.shape[0]
+
+        # Run integration.
+        trajectory = [y0]
+        y_n = y0
+        for n in range(0, n_steps, self.order):
+            xs_n = x[n : (n + self.order)]
+            y_n = self._compute_singlestep_update(xs_n, y_n, ode=ode, order=self.order)
+            trajectory.append(y_n)
+
+        return torch.stack(trajectory, dim=0)
 
 
 # -----------------------------------------------------------------------------
