@@ -8,11 +8,11 @@ from typing import Any, Callable
 import pytorch_lightning as pl
 import torch
 
-from diffusion.denoisers import Denoiser, KarrasDenoiser
+from diffusion.denoisers import Denoiser, KarrasDenoiser, KarrasOptimalDenoiser
 from diffusion.utils import expand_dims
 
 Tensor = torch.Tensor
-WeightingFn = Callable[[Tensor, float], Tensor]  # (sigma, sigma_data) -> Tensor
+LossWeightFn = Callable[[Tensor, float], Tensor]  # (sigma, sigma_data) -> Tensor
 
 
 # -----------------------------------------------------------------------------
@@ -66,9 +66,6 @@ WEIGHTING_SCHEMES = {
 class BaseLossFn(abc.ABC):
     """Abstract base class for loss functions."""
 
-    def __init__(self, weighting_fn: WeightingFn) -> None:
-        self.weighting_fn = weighting_fn
-
     @abc.abstractmethod
     def _loss(
         self, denoiser: Denoiser, input: Tensor, noise: Tensor, sigma: Tensor, **model_kwargs
@@ -76,11 +73,17 @@ class BaseLossFn(abc.ABC):
         """Computes the loss for a batch of inputs. Must be implemented by subclasses."""
 
     def __call__(
-        self, denoiser: Denoiser, input: Tensor, noise: Tensor, sigma: Tensor, **model_kwargs
+        self,
+        denoiser: Denoiser,
+        loss_weight_fn: LossWeightFn,
+        input: Tensor,
+        noise: Tensor,
+        sigma: Tensor,
+        **model_kwargs,
     ) -> Tensor:
         """Computes weighted loss for a batch of inputs."""
         loss = self._loss(denoiser, input, noise, sigma, **model_kwargs)  # shape: [batch_size]
-        weight = self.weighting_fn(sigma, denoiser.sigma_data)  # shape: [batch_size]
+        weight = loss_weight_fn(sigma, denoiser.sigma_data)  # shape: [batch_size]
         return (loss * weight).mean()
 
 
@@ -254,9 +257,8 @@ class EMAWarmupSchedule:
 # -----------------------------------------------------------------------------
 # Evaluation utils.
 # -----------------------------------------------------------------------------
-# TODO: add utils for instrumenting training:
-# - function for computing loss for different noise levels
-# - function for computing log likelihood of the data under the current model
+
+# TODO: add log likelihood computation.
 
 
 # -----------------------------------------------------------------------------
@@ -265,20 +267,36 @@ class EMAWarmupSchedule:
 
 
 class DiffusionModel(pl.LightningModule):
-    """A Pytorch Lightning module for training denoising diffusion models."""
+    """A Pytorch Lightning module for training denoising diffusion models.
+
+    Args:
+        model: A denoising model.
+        loss_fn: A denoising loss function.
+        loss_weight_fn: A loss weighting function.
+        sigma_sampler: A noise level sampler.
+        ema_schedule: An EMA warmup schedule.
+        optimizer_cls: A PyTorch optimizer class.
+        optimizer_kwargs: Keyword arguments for the optimizer.
+        lr_scheduler_cls: A PyTorch learning rate scheduler class.
+        lr_scheduler_kwargs: Keyword arguments for the learning rate scheduler.
+        lr_scheduler_monitor: The metric to monitor for the learning rate scheduler.
+        validation_sigmas: A list of noise levels for which validation losses are computed.
+    """
 
     def __init__(
         self,
         model: Denoiser,
         *,
         loss_fn: BaseLossFn,
+        loss_weight_fn: LossWeightFn,
         sigma_sampler: BaseSigmaSampler,
         ema_schedule: EMAWarmupSchedule,
         optimizer_cls: type[torch.optim.Optimizer],
         optimizer_kwargs: dict[str, Any],
         lr_scheduler_cls: type[torch.optim.lr_scheduler._LRScheduler] | None = None,
         lr_scheduler_kwargs: dict[str, Any] | None = None,
-        lr_scheduler_monitor: str = "train_loss",
+        lr_scheduler_monitor: str | None = None,
+        validation_sigmas: list[float] | None = None,
     ):
         super().__init__()
 
@@ -286,8 +304,10 @@ class DiffusionModel(pl.LightningModule):
         self.model = model
         self.model_ema = copy.deepcopy(model)
 
-        # Save loss function, noise sampler, and EMA schedule.
+        # Save loss and weight functions, noise sampler, and EMA schedule.
         self.loss_fn = loss_fn
+        self.train_loss_weight_fn = loss_weight_fn
+        self.val_loss_weight_fn = WEIGHTING_SCHEMES["uniform"]
         self.sigma_sampler = sigma_sampler
         self.ema_schedule = ema_schedule
 
@@ -299,7 +319,10 @@ class DiffusionModel(pl.LightningModule):
             self._lr_scheduler_builder = functools.partial(
                 lr_scheduler_cls, **(lr_scheduler_kwargs or {})
             )
-        self._lr_scheduler_monitor = lr_scheduler_monitor
+        self._lr_scheduler_monitor = lr_scheduler_monitor or "loss/val"
+
+        # Save validation parameters.
+        self.validation_sigmas = validation_sigmas
 
     def forward(self, input, sigma, **model_kwargs):
         return self.model_ema(input, sigma, **model_kwargs)
@@ -340,14 +363,26 @@ class DiffusionModel(pl.LightningModule):
         batch_size = x_batch.shape[0]
         noise = torch.randn_like(x_batch)
         sigma = self.sigma_sampler(batch_size, device=x_batch.device)
-        loss = self.loss_fn(self.model, x_batch, noise, sigma)
-        self.log("train_loss", loss, prog_bar=True)
+        loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, noise, sigma)
+        self.log("loss/train", loss, prog_bar=True)
         return loss
 
     @torch.inference_mode()
     def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
         """Computes and logs validation metrics."""
-        # TODO: implement this.
-        pass
+        del batch_idx  # Unused.
+        if self.validation_sigmas is None:
+            return
+        total_loss = 0.0
+        x_batch = batch[0]
+        batch_size = x_batch.shape[0]
+        noise = torch.randn_like(x_batch)
+        for sigma_value in self.validation_sigmas:
+            sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
+            loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, noise, sigma)
+            self.log(f"loss/sigma={sigma_value:.1e}/val", loss)
+            total_loss += loss
+        total_loss /= len(self.validation_sigmas)
+        self.log("loss/val", total_loss, prog_bar=True)
 
     # --- Lightning module methods: end ---------------------------------------
