@@ -281,6 +281,8 @@ class DiffusionModel(pl.LightningModule):
         lr_scheduler_kwargs: Keyword arguments for the learning rate scheduler.
         lr_scheduler_monitor: The metric to monitor for the learning rate scheduler.
         validation_sigmas: A list of noise levels for which validation losses are computed.
+        validation_optimal_denoiser: If provided, the optimal denoiser used to compute optimal
+            validation losses, which are then subtracted from the validation losses of the model.
     """
 
     def __init__(
@@ -297,6 +299,7 @@ class DiffusionModel(pl.LightningModule):
         lr_scheduler_kwargs: dict[str, Any] | None = None,
         lr_scheduler_monitor: str | None = None,
         validation_sigmas: list[float] | None = None,
+        validation_optimal_denoiser: KarrasOptimalDenoiser | None = None,
     ):
         super().__init__()
 
@@ -323,6 +326,7 @@ class DiffusionModel(pl.LightningModule):
 
         # Save validation parameters.
         self.validation_sigmas = validation_sigmas
+        self.validation_optimal_denoiser = validation_optimal_denoiser
 
     def forward(self, input, sigma, **model_kwargs):
         return self.model_ema(input, sigma, **model_kwargs)
@@ -373,6 +377,7 @@ class DiffusionModel(pl.LightningModule):
         del batch_idx  # Unused.
         if self.validation_sigmas is None:
             return
+
         total_loss = 0.0
         x_batch = batch[0]
         batch_size = x_batch.shape[0]
@@ -380,7 +385,16 @@ class DiffusionModel(pl.LightningModule):
         for sigma_value in self.validation_sigmas:
             sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
             loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, noise, sigma)
-            self.log(f"loss/sigma={sigma_value:.1e}/val", loss)
+            if self.validation_optimal_denoiser is not None:
+                optimal_loss = self.loss_fn(
+                    self.validation_optimal_denoiser,
+                    self.val_loss_weight_fn,
+                    x_batch,
+                    noise,
+                    sigma,
+                )
+                loss -= optimal_loss
+            self.log(f"loss/sigma_{sigma_value:.1e}/val", loss)
             total_loss += loss
         total_loss /= len(self.validation_sigmas)
         self.log("loss/val", total_loss, prog_bar=True)

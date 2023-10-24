@@ -123,7 +123,7 @@ class KarrasOptimalDenoiser(Denoiser):
         # Iterate over training data and compute the optimal denoised output for the given sigma.
         output = torch.zeros_like(input)
         normalization = torch.zeros_like(sigma)
-        for y_i in self.train_data:
+        for (y_i,) in self.train_data:
             y_i = y_i.unsqueeze(0)
             p_i = self._normal_prob(input, y_i, sigma)
             output += y_i * p_i
