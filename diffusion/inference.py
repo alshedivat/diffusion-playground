@@ -1,6 +1,7 @@
 """Utility functions for running inference for diffusion models."""
 import abc
 from collections import deque
+from enum import Enum
 from typing import Callable
 
 import sympy
@@ -151,7 +152,7 @@ class BaseDiffEq(abc.ABC):
         """
 
     @abc.abstractmethod
-    def dy_dx(self, x: Tensor, y: Tensor) -> Tensor:
+    def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y.
         Must be implemented by subclasses.
         """
@@ -196,23 +197,25 @@ class KarrasDiffEq(BaseDiffEq):
     def sigma_to_x(self, sigma: Tensor) -> Tensor:
         return self._sigma_to_t(sigma)
 
-    def dy_dx(self, x: Tensor, y: Tensor) -> Tensor:
+    def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y, where x is supposed to be time."""
         assert x.numel() == 1, "dy_dx expects a single x value as input."
+        assert len(y_tuple) == 1, "dy_dx expects a single-element tuple y as input."
+        y = y_tuple[0]
         batch_size = y.shape[0]
 
         # Compute sigma and d sigma / dt for each time point in the batch.
         # NOTE: we assume that sigma_fn is an element-wise function.
-        t = x.repeat(batch_size).detach().requires_grad_()  # shape: [batch_size]
-        t = utils.expand_dims(t, y.ndim)  # shape: [batch_size, 1, ...]
-        sigma = self.x_to_sigma(t)  # shape: [batch_size, 1, ...]
-        dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1, ...]
+        with torch.enable_grad():
+            t = x.repeat(batch_size).detach().requires_grad_()  # shape: [batch_size]
+            t = utils.expand_dims(t, y.ndim)  # shape: [batch_size, 1, ...]
+            sigma = self.x_to_sigma(t)  # shape: [batch_size, 1, ...]
+            dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1, ...]
 
         # Compute dy/dx.
-        with torch.inference_mode():
-            dy_dx = (dsigma_dt / sigma) * (y - self.denoiser(y, sigma.squeeze()))
+        dy_dx = (dsigma_dt / sigma) * (y - self.denoiser(y, sigma.squeeze()))
 
-        return dy_dx
+        return (dy_dx,)
 
 
 class LogSnrDiffEq(BaseDiffEq):
@@ -234,17 +237,20 @@ class LogSnrDiffEq(BaseDiffEq):
     def sigma_to_x(self, sigma: Tensor) -> Tensor:
         return utils.sigma_to_logsnr(sigma, self.denoiser.sigma_data)
 
-    @torch.inference_mode()
-    def dy_dx(self, x: Tensor, y: Tensor) -> Tensor:
+    def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y, where x is supposed to be log-SNR."""
         assert x.numel() == 1, "dy_dx expects a single x value as input."
+        assert len(y_tuple) == 1, "dy_dx expects a single-element tuple y as input."
+        y = y_tuple[0]
         batch_size = y.shape[0]
 
         # Compute sigma from log-SNR.
         sigma = self.x_to_sigma(x).repeat(batch_size)
 
         # Compute dy/dx.
-        return (self.denoiser(y, sigma) - y) / 2
+        dy_dx = (self.denoiser(y, sigma) - y) / 2
+
+        return (dy_dx,)
 
 
 # -----------------------------------------------------------------------------
@@ -261,20 +267,31 @@ class BaseDiffEqSolver(abc.ABC):
     use Euler method for the last step, as proposed by Karras et al. (2022).
     """
 
-    def _euler_step(self, x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
+    @staticmethod
+    def _euler_step(
+        x: Tensor, dx: Tensor, y_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
         """Computes Euler step."""
-        dy_dx = ode.dy_dx(x, y)
-        return y + dy_dx * dx
+        dy_dx_tuple = ode.dy_dx(x, y_tuple)
+        # Apply Euler step to each element of y_tuple.
+        update_fn = lambda y, dy_dx: y + dy_dx * dx
+        return tuple(map(update_fn, y_tuple, dy_dx_tuple))
 
     @abc.abstractmethod
-    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _solve(
+        self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
         """Implements integration of the specified spcified ODE over x and returns the y trajectory.
 
         Must be implemented by subclasses.
         """
 
     def solve(
-        self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool | None = None
+        self,
+        x: Tensor,
+        y0_tuple: tuple[Tensor, ...],
+        ode: BaseDiffEq,
+        euler_last_step: bool | None = None,
     ) -> Tensor:
         """Integrates the specified spcified ODE over x and returns the y trajectory."""
         # If the last step of the trajectory corresponds to sigma = 0, use Euler method for the last step.
@@ -287,16 +304,18 @@ class BaseDiffEqSolver(abc.ABC):
             x, x_last_pair = x[:-1], (x[-2], x[-1])
 
         # Run integration.
-        trajectory = self._solve(x, y0, ode)
+        trajectory_tuple = self._solve(x, y0_tuple, ode)
 
         # Special case the last step.
         if euler_last_step:
-            y_last = trajectory[-1]
+            y_last_tuple = tuple(t[-1] for t in trajectory_tuple)
             x_i, x_ip1 = x_last_pair
-            y = self._euler_step(x_i, x_ip1 - x_i, y_last, ode)
-            trajectory = torch.cat([trajectory, y.unsqueeze(0)], dim=0)
+            y_tuple = self._euler_step(x_i, x_ip1 - x_i, y_last_tuple, ode)
+            trajectory_tuple = tuple(
+                torch.cat([t, y.unsqueeze(0)], dim=0) for t, y in zip(trajectory_tuple, y_tuple)
+            )
 
-        return trajectory
+        return trajectory_tuple
 
 
 class TorchDiffEqOdeintSolver(BaseDiffEqSolver):
@@ -305,17 +324,19 @@ class TorchDiffEqOdeintSolver(BaseDiffEqSolver):
     Reference: https://github.com/rtqichen/torchdiffeq.
     """
 
-    def __init__(self, rtol=1e-7, atol=1e-9, method=None, options=None) -> None:
+    def __init__(self, rtol=1e-4, atol=1e-4, method=None, options=None) -> None:
         self.rtol = rtol
         self.atol = atol
         self.method = method
         self.options = options
 
-    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _solve(
+        self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
         """Integrates the specified spcified ODE over x and returns the y trajectory."""
         trajectory = odeint(
             func=ode.dy_dx,
-            y0=y0,
+            y0=y0_tuple,
             t=x,
             rtol=self.rtol,
             atol=self.atol,
@@ -333,23 +354,36 @@ class KarrasHeun2Solver(BaseDiffEqSolver):
     """
 
     @staticmethod
-    def _euler_step_correct(x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _euler_step_correct(
+        x: Tensor, dx: Tensor, y_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
         """Computes Euler step with 2nd order correction."""
-        dy_dx = ode.dy_dx(x, y)
+        dy_dx_tuple = ode.dy_dx(x, y_tuple)
+        # Compute Euler step for each element of y_tuple.
+        update_fn = lambda y, dy_dx: y + dy_dx * dx
+        y_new_tuple = tuple(map(update_fn, y_tuple, dy_dx_tuple))
         # Appy 2nd order correction.
-        dy_dx_new = ode.dy_dx(x + dx, y + dy_dx * dx)
-        return y + 0.5 * (dy_dx + dy_dx_new) * dx
+        dy_dx_new_tuple = ode.dy_dx(x + dx, y_new_tuple)
+        correction_fn = lambda y, dy_dx, dy_dx_new: y + 0.5 * (dy_dx + dy_dx_new) * dx
+        return tuple(map(correction_fn, y_tuple, dy_dx_tuple, dy_dx_new_tuple))
 
-    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
-        trajectory = [y0]
+    def _solve(
+        self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
+        trajectory = [y0_tuple]
 
         # Apply Euler step with 2nd order correction.
-        y = y0
+        y_tuple = y0_tuple
         for x_i, x_ip1 in zip(x[:-1], x[1:]):
-            y = self._euler_step_correct(x_i, x_ip1 - x_i, y, ode)
-            trajectory.append(y)
+            y_tuple = self._euler_step_correct(x_i, x_ip1 - x_i, y_tuple, ode)
+            trajectory.append(y_tuple)
 
-        return torch.stack(trajectory, dim=0)
+        # Stack trajectories.
+        trajectory_tuple = tuple()
+        for i in range(len(trajectory[0])):
+            trajectory_tuple += (torch.stack([t[i] for t in trajectory], dim=0),)
+
+        return trajectory_tuple
 
 
 class DPMppDiffEqSolver(BaseDiffEqSolver):
@@ -451,8 +485,11 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
         return ode.denoiser(y, sigma)
 
-    def _solve(self, x: Tensor, y0: Tensor, ode: LogSnrDiffEq) -> Tensor:
+    def _solve(
+        self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: LogSnrDiffEq
+    ) -> tuple[Tensor, ...]:
         """Depending on the settings, calls either single-step or multi-step method."""
+        y0 = y0_tuple[0]
         if self.multistep:
             return self._solve_multistep(x, y0, ode)
         else:
@@ -460,12 +497,19 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
 
     @torch.inference_mode()
     def solve(
-        self, x: Tensor, y0: Tensor, ode: BaseDiffEq, euler_last_step: bool | None = None
-    ) -> Tensor:
+        self,
+        x: Tensor,
+        y0_tuple: tuple[Tensor, ...],
+        ode: BaseDiffEq,
+        euler_last_step: bool | None = None,
+    ) -> tuple[Tensor, ...]:
         """Sanity checks that ODE is LogSnrDiffEq and calls sovle from the parent class."""
         if not isinstance(ode, LogSnrDiffEq):
             raise ValueError("DPMppDiffEqSolver can only be used to solve LogSnrDiffEq.")
-        return super().solve(x, y0, ode, euler_last_step)
+        assert (
+            len(y0_tuple) == 1
+        ), "DPMppDiffEqSolver.solve expects a single-element y0_tuple as input."
+        return super().solve(x, y0_tuple, ode, euler_last_step)
 
     # --- Common methods ------------------------------------------------------
 
@@ -714,7 +758,12 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
         dx = dx + x - x_hat  # Adjust dx to account for noise injection.
         return super()._euler_step(x_hat, dx, y_hat, ode)
 
-    def _solve(self, x: Tensor, y0: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _solve(
+        self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
+        assert len(y0_tuple) == 1, "_solve expects a single-element y0_tuple as input."
+
+        y0 = y0_tuple[0]
         trajectory = [y0]
 
         # Compute gamma (Algorithm 2, comment next to line 3).
@@ -727,21 +776,22 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
             # Inject noise into the current sample.
             x_i_hat, y_hat = self._inject_noise(x_i, y, ode)
             # Run the ODE solver to x_ip1.
-            y_i_traj = self.ode_solver.solve(
+            y_i_traj_tuple = self.ode_solver.solve(
                 x=torch.stack([x_i_hat, x_ip1]),
-                y0=y_hat,
+                y0_tuple=(y_hat,),
                 ode=ode,
                 euler_last_step=False,
             )
-            y = y_i_traj[-1]
+            y = y_i_traj_tuple[0][-1]
             trajectory.append(y)
 
-        return torch.stack(trajectory, dim=0)
+        return (torch.stack(trajectory, dim=0),)
 
 
 # -----------------------------------------------------------------------------
 
 
+@torch.no_grad()
 def sample(
     input_shape: tuple[int, ...],
     ode: BaseDiffEq,
@@ -750,8 +800,8 @@ def sample(
     batch_size: int,
     n_steps: int,
     device="cpu",
-) -> tuple[Tensor, list[Tensor]]:
-    """Generates samples using the specified ODE and solver, and noise schedule."""
+) -> Tensor:
+    """Generates samples using the specified ODE, solver, and noise schedule."""
     # Generate grid.
     if isinstance(ode, KarrasDiffEq):
         x, sigma0 = noise_schedule.get_t_schedule(n_steps)
@@ -767,6 +817,6 @@ def sample(
     ode.denoiser.to(device)
 
     # Run solver.
-    trajectory = solver.solve(x, y0, ode)
+    trajectory_tuple = solver.solve(x, y0_tuple=(y0,), ode=ode)
 
-    return trajectory
+    return trajectory_tuple[0]

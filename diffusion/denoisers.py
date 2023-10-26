@@ -96,7 +96,7 @@ class KarrasOptimalDenoiser(Denoiser):
     The optimal denoiser depends on the training data and takes the following form:
 
         D(y, sigma) = [sum_i y_i Gau(y; y_i, sigma**2)] / [sum_i Gau(y; y_i, sigma**2)],
-        where Gau(y; y_i, sigma) is Gaussian dencity with mean y_i and std sigma.
+        where Gau(y; y_i, sigma) is Gaussian density with mean y_i and std sigma.
 
     For details see Appendix B.3 in Karras et al. (2022).
 
