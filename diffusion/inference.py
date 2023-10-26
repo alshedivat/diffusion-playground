@@ -46,6 +46,15 @@ class BaseNoiseSchedule(abc.ABC):
     def get_logsnr_schedule(self, n: int) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of log-SNR steps and sigma0. Must be implemented by subclasses."""
 
+    def compute_prior_logp(self, y: Tensor) -> Tensor:
+        """Computes the prior log-probability of the specified y."""
+        batch_size = y.shape[0]
+        sigma0 = self.get_sigma_schedule(1)[1]
+        log_prob_per_dim = (
+            -0.5 * (y / sigma0) ** 2 - torch.log(sigma0) - 0.5 * torch.log(2 * torch.pi)
+        )
+        return torch.sum(log_prob_per_dim.view(batch_size, -1), dim=1)
+
 
 class KarrasNoiseSchedule(BaseNoiseSchedule):
     """Specifies noise schedule proposed by Karras et al. (2022).
@@ -199,8 +208,13 @@ class KarrasDiffEq(BaseDiffEq):
 
     def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y, where x is supposed to be time."""
-        assert x.numel() == 1, "dy_dx expects a single x value as input."
-        assert len(y_tuple) == 1, "dy_dx expects a single-element tuple y as input."
+        if not x.numel() == 1:
+            raise ValueError(f"{self.__class__.__name__}.dy_dx expects a single x value as input.")
+        if not len(y_tuple) == 1:
+            raise ValueError(
+                f"{self.__class__.__name__}.dy_dx expects a single-element y_tuple as input."
+            )
+
         y = y_tuple[0]
         batch_size = y.shape[0]
 
@@ -239,8 +253,13 @@ class LogSnrDiffEq(BaseDiffEq):
 
     def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y, where x is supposed to be log-SNR."""
-        assert x.numel() == 1, "dy_dx expects a single x value as input."
-        assert len(y_tuple) == 1, "dy_dx expects a single-element tuple y as input."
+        if not x.numel() == 1:
+            raise ValueError(f"{self.__class__.__name__}.dy_dx expects a single x value as input.")
+        if not len(y_tuple) == 1:
+            raise ValueError(
+                f"{self.__class__.__name__}.dy_dx expects a single-element y_tuple as input."
+            )
+
         y = y_tuple[0]
         batch_size = y.shape[0]
 
@@ -251,6 +270,75 @@ class LogSnrDiffEq(BaseDiffEq):
         dy_dx = (self.denoiser(y, sigma) - y) / 2
 
         return (dy_dx,)
+
+
+class DivDiffEq(BaseDiffEq):
+    """Implements divergence ODE which can be used for computing log-likelihood of data.
+
+    In addition to dy_dx of the underlying base ODE, calculates the divergence of dy_dx
+    using Hutchinson-Skilling trace estimator:
+
+        div(dy/dx) = E_{eps ~ p(eps)} [eps^T * d(dy/dx)/dx * eps],
+        where eps is a random vector sampled from p(eps) with E[eps] = 0
+        and E[eps * eps^T] = I.
+
+    Integrating over divergence is used for computing the log-likelihood of the data.
+
+    Args:
+        base_ode: The ODE that specifies the reverse diffusion process.
+        n_eps_samples: The number of eps samples used for estimating the divergence.
+        hutichison_type: The type of eps samples used for estimating the divergence.
+    """
+
+    class HutchisonType(str, Enum):
+        RADEMACHER = "rademacher"
+        GAUSSIAN = "gaussian"
+
+    def __init__(
+        self,
+        base_ode: BaseDiffEq,
+        n_eps_samples: int = 1,
+        hutchison_type: HutchisonType = HutchisonType.RADEMACHER,
+    ) -> None:
+        self.base_ode = base_ode
+        self.n_eps_samples = n_eps_samples
+        self.hutchison_type = hutchison_type
+
+    def x_to_sigma(self, x: Tensor) -> Tensor:
+        return self.base_ode.x_to_sigma(x)
+
+    def sigma_to_x(self, sigma: Tensor) -> Tensor:
+        return self.base_ode.sigma_to_x(sigma)
+
+    def _sample_eps(self, y: Tensor) -> Tensor:
+        """Samples eps from p(eps) with E[eps] = 0 and E[eps * eps^T] = I."""
+        eps = torch.randn((self.n_eps_samples,) + y.shape, device=y.device)
+        if self.hutchison_type == self.HutchisonType.RADEMACHER:
+            eps = torch.sign(eps)
+        return eps
+
+    def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
+        """Computes divergence for base_ode.dy/dx using Hutchinson-Skilling trace estimator."""
+        if not len(y_tuple) == 2:
+            raise ValueError(
+                f"{self.__class__.__name__}.dy_dx expects a two-element y_tuple as input."
+            )
+
+        y = y_tuple[0]
+
+        # Compute dy_dx and the corresponding divergence estimate.
+        eps = self._sample_eps(y)  # shape: [n_eps_samples, batch_size, ...]
+        with torch.enable_grad():
+            y = y.detach().requires_grad_()
+            dy_dx = self.base_ode.dy_dx(x, y)  # shape: [batch_size, ...]
+            dy_dx_eps_sum = torch.sum(dy_dx.unsqueeze(0) * eps)  # shape: []
+            grad_dy_dx_eps = torch.autograd.grad(dy_dx_eps_sum, y)[0]  # shape: [batch_size, ...]
+        div_dy_dx_eps = torch.mean(
+            grad_dy_dx_eps.unsqueeze(0) * eps, dim=0
+        )  # shape: [batch_size, ...]
+        div_dy_dx = torch.sum(div_dy_dx_eps, dim=tuple(range(1, y.ndim)))  # shape: [batch_size]
+
+        return dy_dx, div_dy_dx
 
 
 # -----------------------------------------------------------------------------
@@ -282,7 +370,6 @@ class BaseDiffEqSolver(abc.ABC):
         self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
     ) -> tuple[Tensor, ...]:
         """Implements integration of the specified spcified ODE over x and returns the y trajectory.
-
         Must be implemented by subclasses.
         """
 
@@ -495,7 +582,6 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         else:
             return self._solve_singlestep(x, y0, ode)
 
-    @torch.inference_mode()
     def solve(
         self,
         x: Tensor,
@@ -506,9 +592,8 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         """Sanity checks that ODE is LogSnrDiffEq and calls sovle from the parent class."""
         if not isinstance(ode, LogSnrDiffEq):
             raise ValueError("DPMppDiffEqSolver can only be used to solve LogSnrDiffEq.")
-        assert (
-            len(y0_tuple) == 1
-        ), "DPMppDiffEqSolver.solve expects a single-element y0_tuple as input."
+        if not len(y0_tuple) == 1:
+            raise ValueError("DPMppDiffEqSolver.solve expects a single-element y0_tuple as input.")
         return super().solve(x, y0_tuple, ode, euler_last_step)
 
     # --- Common methods ------------------------------------------------------
@@ -761,8 +846,6 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
     def _solve(
         self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
     ) -> tuple[Tensor, ...]:
-        assert len(y0_tuple) == 1, "_solve expects a single-element y0_tuple as input."
-
         y0 = y0_tuple[0]
         trajectory = [y0]
 
@@ -786,6 +869,15 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
             trajectory.append(y)
 
         return (torch.stack(trajectory, dim=0),)
+
+    def solve(
+        self, x: Tensor, y0_tuple: tuple, ode: BaseDiffEq, euler_last_step: bool | None = None
+    ) -> Tensor:
+        if not len(y0_tuple) == 1:
+            raise ValueError(
+                f"{self.__class__.__name__}.solve expects a single-element y0_tuple as input."
+            )
+        return super().solve(x, y0_tuple, ode, euler_last_step)
 
 
 # -----------------------------------------------------------------------------
@@ -820,3 +912,43 @@ def sample(
     trajectory_tuple = solver.solve(x, y0_tuple=(y0,), ode=ode)
 
     return trajectory_tuple[0]
+
+
+@torch.no_grad()
+def neg_log_likelihood(
+    samples: Tensor,
+    ode: BaseDiffEq,
+    solver: BaseDiffEqSolver,
+    noise_schedule: BaseNoiseSchedule,
+    n_steps: int,
+    n_eps_samples: int = 1,
+    hutchison_type: DivDiffEq.HutchisonType = DivDiffEq.HutchisonType.RADEMACHER,
+    device="cpu",
+) -> Tensor:
+    """Computes log-likelihood of the samples using the specified ODE, solver, and noise schedule."""
+    # Generate grid.
+    if isinstance(ode, KarrasDiffEq):
+        x, _ = noise_schedule.get_t_schedule(n_steps)
+    elif isinstance(ode, LogSnrDiffEq):
+        x, _ = noise_schedule.get_logsnr_schedule(n_steps)
+    else:
+        raise ValueError(f"Unknown ODE type: {type(ode)}")
+
+    # Transfer denosing model to the specified device.
+    ode.denoiser.to(device)
+
+    # Define divergence ODE.
+    div_ode = DivDiffEq(ode, n_eps_samples=n_eps_samples, hutchison_type=hutchison_type)
+
+    # Reverse x and integrate divergence ODE.
+    x_reverse = x[::-1]
+    batch_size = samples.shape[0]
+    ll0 = torch.zeros(batch_size, device=device)
+    trajectory_tuple = solver.solve(x_reverse, y0_tuple=(samples, ll0), ode=div_ode)
+
+    # Compute negative log-likelihood
+    y_last, delta_logp = trajectory_tuple[0][-1], trajectory_tuple[1][-1]
+    prior_logp = noise_schedule.compute_prior_logp(y_last)  # shape: [batch_size]
+    nll = -(prior_logp + delta_logp)  # shape: [batch_size]
+
+    return nll
