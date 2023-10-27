@@ -32,6 +32,7 @@ class SimpleDenoiser(Denoiser):
     """Simple denoiser that does not perform any preconditioning."""
 
     def __init__(self, model):
+        super().__init__()
         self.model = model
 
     def forward(self, input, sigma, **kwargs):
@@ -103,19 +104,18 @@ class KarrasOptimalDenoiser(Denoiser):
     Reference: https://arxiv.org/abs/2206.00364.
     """
 
-    def __init__(self, train_data):
+    def __init__(self, train_data, sigma_data):
         super().__init__()
         self.train_data = train_data
+        self.sigma_data = sigma_data
 
-        # Compute sigma_data.
-        self.sigma_data = torch.std(self.train_data.tensors[0])
-
-    def _normal_prob(self, x, mu, sigma):
+    @staticmethod
+    def _normal_prob(x, mu, sigma):
         batch_size = x.shape[0]
         prob_per_dim = torch.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * (2 * torch.pi) ** 0.5)
         return torch.prod(prob_per_dim.view(batch_size, -1), dim=-1, keepdim=True)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input, sigma, **kwargs):
         del kwargs  # Unused.
         sigma = utils.expand_dims(sigma, input.ndim)
@@ -124,7 +124,7 @@ class KarrasOptimalDenoiser(Denoiser):
         output = torch.zeros_like(input)
         normalization = torch.zeros_like(sigma)
         for (y_i,) in self.train_data:
-            y_i = y_i.unsqueeze(0)
+            y_i = y_i.unsqueeze(0).to(input.device)
             p_i = self._normal_prob(input, y_i, sigma)
             output += y_i * p_i
             normalization += p_i
