@@ -171,7 +171,7 @@ class LogNormalNoiseSampler(BaseSigmaSampler):
 # -----------------------------------------------------------------------------
 # Exponential moving average (EMA) update for model parameters.
 # -----------------------------------------------------------------------------
-# EMA code is copied with modification from: https://github.com/crowsonkb/k-diffusion.
+# EMA code is adapted from: https://github.com/crowsonkb/k-diffusion.
 # The original code is made available by Katherine Crowson under the MIT license.
 # -----------------------------------------------------------------------------
 
@@ -187,6 +187,7 @@ def ema_update(model, model_ema, decay):
     assert model_params.keys() == averaged_params.keys()
 
     for name, param in model_params.items():
+        param = param.to(averaged_params[name].device)
         averaged_params[name].mul_(decay).add_(param, alpha=1 - decay)
 
     model_buffers = dict(model.named_buffers())

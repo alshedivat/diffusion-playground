@@ -1,5 +1,6 @@
 """Utility functions for running inference for diffusion models."""
 import abc
+import math
 from collections import deque
 from enum import Enum
 from typing import Callable
@@ -51,7 +52,7 @@ class BaseNoiseSchedule(abc.ABC):
         batch_size = y.shape[0]
         sigma0 = self.get_sigma_schedule(1)[1]
         log_prob_per_dim = (
-            -0.5 * (y / sigma0) ** 2 - torch.log(sigma0) - 0.5 * torch.log(2 * torch.pi)
+            -0.5 * (y / sigma0) ** 2 - torch.log(sigma0) - 0.5 * math.log(2 * torch.pi)
         )
         return torch.sum(log_prob_per_dim.view(batch_size, -1), dim=1)
 
@@ -330,7 +331,7 @@ class DivDiffEq(BaseDiffEq):
         eps = self._sample_eps(y)  # shape: [n_eps_samples, batch_size, ...]
         with torch.enable_grad():
             y = y.detach().requires_grad_()
-            dy_dx = self.base_ode.dy_dx(x, y)  # shape: [batch_size, ...]
+            (dy_dx,) = self.base_ode.dy_dx(x, (y,))  # shape: [batch_size, ...]
             dy_dx_eps_sum = torch.sum(dy_dx.unsqueeze(0) * eps)  # shape: []
             grad_dy_dx_eps = torch.autograd.grad(dy_dx_eps_sum, y)[0]  # shape: [batch_size, ...]
         div_dy_dx_eps = torch.mean(
@@ -578,9 +579,9 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         """Depending on the settings, calls either single-step or multi-step method."""
         y0 = y0_tuple[0]
         if self.multistep:
-            return self._solve_multistep(x, y0, ode)
+            return (self._solve_multistep(x, y0, ode),)
         else:
-            return self._solve_singlestep(x, y0, ode)
+            return (self._solve_singlestep(x, y0, ode),)
 
     def solve(
         self,
@@ -712,7 +713,7 @@ class DPMppDiffEqSolver(BaseDiffEqSolver):
         n_steps_new = n_steps + (n_steps - 1) * k
 
         # Create a new tensor to store the interpolated values
-        new_x = torch.zeros(n_steps_new)
+        new_x = torch.zeros(n_steps_new, device=x.device, dtype=x.dtype)
 
         for i in range(n_steps - 1):
             start_value = x[i]
@@ -941,7 +942,7 @@ def neg_log_likelihood(
     div_ode = DivDiffEq(ode, n_eps_samples=n_eps_samples, hutchison_type=hutchison_type)
 
     # Reverse x and integrate divergence ODE.
-    x_reverse = x[::-1]
+    x_reverse = torch.flip(x, dims=(0,))
     batch_size = samples.shape[0]
     ll0 = torch.zeros(batch_size, device=device)
     trajectory_tuple = solver.solve(x_reverse, y0_tuple=(samples, ll0), ode=div_ode)
