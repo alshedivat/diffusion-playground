@@ -3,12 +3,20 @@ import abc
 import copy
 import functools
 import math
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import pytorch_lightning as pl
 import torch
 
 from diffusion.denoisers import Denoiser, KarrasDenoiser, KarrasOptimalDenoiser
+from diffusion.inference import (
+    BaseDiffEq,
+    BaseDiffEqSolver,
+    BaseNoiseSchedule,
+    DivDiffEq,
+    neg_log_likelihood,
+)
 from diffusion.utils import expand_dims
 
 Tensor = torch.Tensor
@@ -256,15 +264,20 @@ class EMAWarmupSchedule:
 
 
 # -----------------------------------------------------------------------------
-# Evaluation utils.
-# -----------------------------------------------------------------------------
-
-# TODO: add log likelihood computation.
-
-
-# -----------------------------------------------------------------------------
 # Lightning module for training diffusion models.
 # -----------------------------------------------------------------------------
+
+
+@dataclass
+class LoglikelihoodOptions:
+    """Options for computing log-likelihoods during training."""
+
+    ode: BaseDiffEq
+    solver: BaseDiffEqSolver
+    noise_schedule: BaseNoiseSchedule
+    n_steps: int
+    n_eps_samples: int
+    hutchison_type: DivDiffEq.HutchisonType
 
 
 class DiffusionModel(pl.LightningModule):
@@ -282,7 +295,7 @@ class DiffusionModel(pl.LightningModule):
         lr_scheduler_kwargs: Keyword arguments for the learning rate scheduler.
         lr_scheduler_monitor: The metric to monitor for the learning rate scheduler.
         validation_sigmas: A list of noise levels for which validation losses are computed.
-        validation_optimal_denoiser: If provided, the optimal denoiser used to compute optimal
+        validation_optimal_denoiser: If provided, the optimal denoiser is used to compute optimal
             validation losses, which are then subtracted from the validation losses of the model.
     """
 
@@ -299,8 +312,6 @@ class DiffusionModel(pl.LightningModule):
         lr_scheduler_cls: type[torch.optim.lr_scheduler._LRScheduler] | None = None,
         lr_scheduler_kwargs: dict[str, Any] | None = None,
         lr_scheduler_monitor: str | None = None,
-        validation_sigmas: list[float] | None = None,
-        validation_optimal_denoiser: KarrasOptimalDenoiser | None = None,
     ):
         super().__init__()
 
@@ -325,8 +336,15 @@ class DiffusionModel(pl.LightningModule):
             )
         self._lr_scheduler_monitor = lr_scheduler_monitor or "loss/val"
 
-        # Save validation parameters.
+    def setup_validation(
+        self,
+        validation_sigmas: list[float] | None = None,
+        validation_nll_fn: Callable[[Tensor], Tensor] | None = None,
+        validation_optimal_denoiser: KarrasOptimalDenoiser | None = None,
+    ):
+        """Saves paramters necessary for computing validation metrics."""
         self.validation_sigmas = validation_sigmas
+        self.validation_nll_fn = validation_nll_fn
         self.validation_optimal_denoiser = validation_optimal_denoiser
 
     def forward(self, input, sigma, **model_kwargs):
@@ -372,32 +390,36 @@ class DiffusionModel(pl.LightningModule):
         self.log("loss/train", loss, prog_bar=True)
         return loss
 
-    @torch.inference_mode()
     def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
         """Computes and logs validation metrics."""
         del batch_idx  # Unused.
-        if self.validation_sigmas is None:
-            return
-
-        total_loss = 0.0
         x_batch = batch[0]
-        batch_size = x_batch.shape[0]
-        noise = torch.randn_like(x_batch)
-        for sigma_value in self.validation_sigmas:
-            sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
-            loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, noise, sigma)
-            if self.validation_optimal_denoiser is not None:
-                optimal_loss = self.loss_fn(
-                    self.validation_optimal_denoiser,
-                    self.val_loss_weight_fn,
-                    x_batch,
-                    noise,
-                    sigma,
-                )
-                loss -= optimal_loss
-            self.log(f"loss/sigma_{sigma_value:.1e}/val", loss)
-            total_loss += loss
-        total_loss /= len(self.validation_sigmas)
-        self.log("loss/val", total_loss, prog_bar=True)
+
+        # Compute validation losses for each noise level.
+        if self.validation_sigmas is not None:
+            total_loss = 0.0
+            batch_size = x_batch.shape[0]
+            noise = torch.randn_like(x_batch)
+            for sigma_value in self.validation_sigmas:
+                sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
+                loss = self.loss_fn(self.model_ema, self.val_loss_weight_fn, x_batch, noise, sigma)
+                if self.validation_optimal_denoiser is not None:
+                    optimal_loss = self.loss_fn(
+                        self.validation_optimal_denoiser,
+                        self.val_loss_weight_fn,
+                        x_batch,
+                        noise,
+                        sigma,
+                    )
+                    loss -= optimal_loss
+                self.log(f"loss/sigma_{sigma_value:.1e}/val", loss)
+                total_loss += loss
+            total_loss /= len(self.validation_sigmas)
+            self.log("loss/val", total_loss, prog_bar=True)
+
+        # Compute validation log-likelihoods.
+        if self.validation_nll_fn is not None:
+            nll = self.validation_nll_fn(x_batch).mean()
+            self.log("nll/val", nll, prog_bar=True)
 
     # --- Lightning module methods: end ---------------------------------------

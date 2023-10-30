@@ -36,21 +36,21 @@ class BaseNoiseSchedule(abc.ABC):
         """Defines element-wise function sigma(t). Must be implemented by subclasses."""
 
     @abc.abstractmethod
-    def get_t_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_t_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of time steps and sigma0. Must be implemented by subclasses."""
 
     @abc.abstractmethod
-    def get_sigma_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_sigma_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of sigma steps and sigma0. Must be implemented by subclasses."""
 
     @abc.abstractmethod
-    def get_logsnr_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_logsnr_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of log-SNR steps and sigma0. Must be implemented by subclasses."""
 
     def compute_prior_logp(self, y: Tensor) -> Tensor:
         """Computes the prior log-probability of the specified y."""
         batch_size = y.shape[0]
-        sigma0 = self.get_sigma_schedule(1)[1]
+        sigma0 = self.get_sigma_schedule(1, device=y.device)[1]
         log_prob_per_dim = (
             -0.5 * (y / sigma0) ** 2 - torch.log(sigma0) - 0.5 * math.log(2 * torch.pi)
         )
@@ -67,14 +67,11 @@ class KarrasNoiseSchedule(BaseNoiseSchedule):
     Reference: https://arxiv.org/abs/2206.00364.
     """
 
-    def __init__(
-        self, sigma_data: float, sigma_min: float, sigma_max: float, rho: float = 7.0, device="cpu"
-    ):
+    def __init__(self, sigma_data: float, sigma_min: float, sigma_max: float, rho: float = 7.0):
         self.sigma_data = sigma_data
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.rho = rho
-        self.device = device
 
         # Precompute some constants.
         self.sigma_min_inv_rho = self.sigma_min ** (1 / self.rho)
@@ -84,53 +81,52 @@ class KarrasNoiseSchedule(BaseNoiseSchedule):
         """Defines element-wise function sigma(t) = t."""
         return t
 
-    def get_sigma_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_sigma_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of sigma steps."""
         steps = torch.linspace(0, 1, n)
         sigma = (
             self.sigma_max_inv_rho + steps * (self.sigma_min_inv_rho - self.sigma_max_inv_rho)
         ) ** self.rho
-        sigma = _append_zero(sigma).to(self.device)
+        sigma = _append_zero(sigma).to(device)
         return sigma, sigma[0]
 
-    def get_t_schedule(self, n_steps: int) -> tuple[Tensor, Tensor]:
+    def get_t_schedule(self, n_steps: int, device: str) -> tuple[Tensor, Tensor]:
         """Returns a tensor of time steps calculated as t = sigma_inv(sigma)."""
-        return self.get_sigma_schedule(n_steps)
+        return self.get_sigma_schedule(n_steps, device=device)
 
-    def get_logsnr_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_logsnr_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of log-SNR steps computed from sigma."""
-        sigma, sigma0 = self.get_sigma_schedule(n)
+        sigma, sigma0 = self.get_sigma_schedule(n, device=device)
         return 2 * torch.log(self.sigma_data / sigma), sigma0
 
 
 class LinearLogSnrNoiseSchedule(BaseNoiseSchedule):
     """Specifies a schedule linear in the log-SNR space."""
 
-    def __init__(self, sigma_data: float, logsnr_min: float, logsnr_max: float, device="cpu"):
+    def __init__(self, sigma_data: float, logsnr_min: float, logsnr_max: float):
         self.sigma_data = sigma_data
         self.logsnr_min = logsnr_min
         self.logsnr_max = logsnr_max
-        self.device = device
 
     def sigma_fn(self, t: Tensor) -> Tensor:
         """Defines element-wise function sigma(t) = t."""
         return t
 
-    def get_logsnr_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_logsnr_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of log-SNR steps."""
         steps = torch.linspace(0, 1, n)
-        logsnr = (self.logsnr_min + steps * (self.logsnr_max - self.logsnr_min)).to(self.device)
+        logsnr = (self.logsnr_min + steps * (self.logsnr_max - self.logsnr_min)).to(device)
         sigma0 = self.sigma_data * torch.exp(-logsnr[0] / 2)
         return logsnr, sigma0
 
-    def get_sigma_schedule(self, n: int) -> tuple[Tensor, Tensor]:
+    def get_sigma_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of sigma steps computed from log-SNR."""
-        logsnr, sigma0 = self.get_logsnr_schedule(n)
+        logsnr, sigma0 = self.get_logsnr_schedule(n, device=device)
         return self.sigma_data * torch.exp(-logsnr / 2), sigma0
 
-    def get_t_schedule(self, n_steps: int) -> tuple[Tensor, Tensor]:
+    def get_t_schedule(self, n_steps: int, device: str) -> tuple[Tensor, Tensor]:
         """Returns a tensor of time steps calculated as t = sigma_inv(sigma)."""
-        return self.get_sigma_schedule(n_steps)
+        return self.get_sigma_schedule(n_steps, device=device)
 
 
 # -----------------------------------------------------------------------------
@@ -897,9 +893,9 @@ def sample(
     """Generates samples using the specified ODE, solver, and noise schedule."""
     # Generate grid.
     if isinstance(ode, KarrasDiffEq):
-        x, sigma0 = noise_schedule.get_t_schedule(n_steps)
+        x, sigma0 = noise_schedule.get_t_schedule(n_steps, device=device)
     elif isinstance(ode, LogSnrDiffEq):
-        x, sigma0 = noise_schedule.get_logsnr_schedule(n_steps)
+        x, sigma0 = noise_schedule.get_logsnr_schedule(n_steps, device=device)
     else:
         raise ValueError(f"Unknown ODE type: {type(ode)}")
 
@@ -917,35 +913,47 @@ def sample(
 
 @torch.no_grad()
 def neg_log_likelihood(
-    samples: Tensor,
+    data: Tensor,
     ode: BaseDiffEq,
     solver: BaseDiffEqSolver,
     noise_schedule: BaseNoiseSchedule,
     n_steps: int,
     n_eps_samples: int = 1,
     hutchison_type: DivDiffEq.HutchisonType = DivDiffEq.HutchisonType.RADEMACHER,
-    device="cpu",
 ) -> Tensor:
-    """Computes log-likelihood of the samples using the specified ODE, solver, and noise schedule."""
+    """Computes log-likelihood of the samples using the specified ODE, solver, and noise schedule.
+
+    Args:
+        data: A batch of data samples for which log-likehood is computed.
+        ode: An ODE that defines the probability flow of the diffusion process.
+        solver: An ODE solver to use for integration.
+        noise_schedule: A noise schedule that defines integration trajectory.
+        n_steps: Number of steps in the integration trajectory.
+        n_eps_samples: Number of samples used to estimate divergence.
+        hutichison_type: Type of random variable used by Hutchison-Skilling divergence estimator.
+
+    Returns:
+        A batch of negative log-likelihood values for the provided data samples.
+    """
     # Generate grid.
     if isinstance(ode, KarrasDiffEq):
-        x, _ = noise_schedule.get_t_schedule(n_steps)
+        x, _ = noise_schedule.get_t_schedule(n_steps, device=data.device)
     elif isinstance(ode, LogSnrDiffEq):
-        x, _ = noise_schedule.get_logsnr_schedule(n_steps)
+        x, _ = noise_schedule.get_logsnr_schedule(n_steps, device=data.device)
     else:
         raise ValueError(f"Unknown ODE type: {type(ode)}")
 
     # Transfer denosing model to the specified device.
-    ode.denoiser.to(device)
+    ode.denoiser.to(data.device)
 
     # Define divergence ODE.
     div_ode = DivDiffEq(ode, n_eps_samples=n_eps_samples, hutchison_type=hutchison_type)
 
     # Reverse x and integrate divergence ODE.
     x_reverse = torch.flip(x, dims=(0,))
-    batch_size = samples.shape[0]
-    ll0 = torch.zeros(batch_size, device=device)
-    trajectory_tuple = solver.solve(x_reverse, y0_tuple=(samples, ll0), ode=div_ode)
+    batch_size = data.shape[0]
+    ll0 = torch.zeros(batch_size, device=data.device)
+    trajectory_tuple = solver.solve(x_reverse, y0_tuple=(data, ll0), ode=div_ode)
 
     # Compute negative log-likelihood
     y_last, delta_logp = trajectory_tuple[0][-1], trajectory_tuple[1][-1]
