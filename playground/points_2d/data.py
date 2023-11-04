@@ -26,9 +26,3 @@ def create_train_val_datasets(
     val_data_tensor = torch.from_numpy(val_df.to_numpy().astype(np.float32))
     val_dataset = torch.utils.data.TensorDataset(val_data_tensor)
     return train_dataset, val_dataset
-
-
-def create_train_val_dataloaders(train_dataset, val_dataset, batch_size: int = 256):
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader

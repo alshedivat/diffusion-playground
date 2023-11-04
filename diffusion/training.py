@@ -268,16 +268,38 @@ class EMAWarmupSchedule:
 # -----------------------------------------------------------------------------
 
 
-@dataclass
-class LoglikelihoodOptions:
-    """Options for computing log-likelihoods during training."""
+class DiffusionDatasetWrapper(torch.utils.data.Dataset):
+    """A wrapper for a PyTorch dataset that generates noise tensors.
 
-    ode: BaseDiffEq
-    solver: BaseDiffEqSolver
-    noise_schedule: BaseNoiseSchedule
-    n_steps: int
-    n_eps_samples: int
-    hutchison_type: DivDiffEq.HutchisonType
+    Args:
+        dataset: A PyTorch dataset.
+        drop_last: Whether to drop the last batch if it is smaller than batch_size.
+        fixed_noise: If True, the noise is generated during the first epoch and then reused.
+    """
+
+    def __init__(
+        self,
+        dataset: torch.utils.data.Dataset,
+        fixed_noise: bool = False,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.fixed_noise = fixed_noise
+        self.noise_cache = {}
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        x, *_ = self.dataset[index]
+        # Generate noise tensor if it is not cached.
+        if index not in self.noise_cache:
+            noise = torch.randn_like(x)
+            if self.fixed_noise:
+                self.noise_cache[index] = noise
+        else:
+            noise = self.noise_cache[index]
+        return x, *_, noise
 
 
 class DiffusionModel(pl.LightningModule):
@@ -346,6 +368,7 @@ class DiffusionModel(pl.LightningModule):
         self.validation_sigmas = validation_sigmas
         self.validation_nll_fn = validation_nll_fn
         self.validation_optimal_denoiser = validation_optimal_denoiser
+        self.validation_optimal_loss_cache = {}
 
     def forward(self, input, sigma, **model_kwargs):
         return self.model_ema(input, sigma, **model_kwargs)
@@ -382,36 +405,37 @@ class DiffusionModel(pl.LightningModule):
     def training_step(self, batch: list[Tensor], batch_idx: int) -> Tensor:
         """Samples noise level and computes loss."""
         del batch_idx  # Unused.
-        x_batch = batch[0]
+        x_batch, *_, n_batch = batch
         batch_size = x_batch.shape[0]
-        noise = torch.randn_like(x_batch)
         sigma = self.sigma_sampler(batch_size, device=x_batch.device)
-        loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, noise, sigma)
+        loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, n_batch, sigma)
         self.log("loss/train", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
         """Computes and logs validation metrics."""
-        del batch_idx  # Unused.
-        x_batch = batch[0]
+        x_batch, *_, n_batch = batch
 
         # Compute validation losses for each noise level.
         if self.validation_sigmas is not None:
             total_loss = 0.0
             batch_size = x_batch.shape[0]
-            noise = torch.randn_like(x_batch)
             for sigma_value in self.validation_sigmas:
                 sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
-                loss = self.loss_fn(self.model_ema, self.val_loss_weight_fn, x_batch, noise, sigma)
+                loss = self.loss_fn(
+                    self.model_ema, self.val_loss_weight_fn, x_batch, n_batch, sigma
+                )
                 if self.validation_optimal_denoiser is not None:
-                    optimal_loss = self.loss_fn(
-                        self.validation_optimal_denoiser,
-                        self.val_loss_weight_fn,
-                        x_batch,
-                        noise,
-                        sigma,
-                    )
-                    loss -= optimal_loss
+                    optimal_loss_idx = (batch_idx, sigma_value)
+                    if optimal_loss_idx not in self.validation_optimal_loss_cache:
+                        self.validation_optimal_loss_cache[optimal_loss_idx] = self.loss_fn(
+                            self.validation_optimal_denoiser,
+                            self.val_loss_weight_fn,
+                            x_batch,
+                            n_batch,
+                            sigma,
+                        )
+                    loss -= self.validation_optimal_loss_cache[optimal_loss_idx]
                 self.log(f"loss/sigma_{sigma_value:.1e}/val", loss)
                 total_loss += loss
             total_loss /= len(self.validation_sigmas)
