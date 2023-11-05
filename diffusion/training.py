@@ -356,7 +356,7 @@ class DiffusionModel(pl.LightningModule):
             self._lr_scheduler_builder = functools.partial(
                 lr_scheduler_cls, **(lr_scheduler_kwargs or {})
             )
-        self._lr_scheduler_monitor = lr_scheduler_monitor or "loss/val"
+        self._lr_scheduler_monitor = lr_scheduler_monitor or "val/loss"
 
     def setup_validation(
         self,
@@ -409,7 +409,7 @@ class DiffusionModel(pl.LightningModule):
         batch_size = x_batch.shape[0]
         sigma = self.sigma_sampler(batch_size, device=x_batch.device)
         loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, n_batch, sigma)
-        self.log("loss/train", loss, prog_bar=True)
+        self.log("train/loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
@@ -419,10 +419,12 @@ class DiffusionModel(pl.LightningModule):
         # Compute validation losses for each noise level.
         if self.validation_sigmas is not None:
             total_loss = 0.0
+            total_loss_ema = 0.0
             batch_size = x_batch.shape[0]
             for sigma_value in self.validation_sigmas:
                 sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
-                loss = self.loss_fn(
+                loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, n_batch, sigma)
+                loss_ema = self.loss_fn(
                     self.model_ema, self.val_loss_weight_fn, x_batch, n_batch, sigma
                 )
                 if self.validation_optimal_denoiser is not None:
@@ -436,14 +438,19 @@ class DiffusionModel(pl.LightningModule):
                             sigma,
                         )
                     loss -= self.validation_optimal_loss_cache[optimal_loss_idx]
-                self.log(f"loss/sigma_{sigma_value:.1e}/val", loss)
+                    loss_ema -= self.validation_optimal_loss_cache[optimal_loss_idx]
+                self.log(f"val/loss/sigma_{sigma_value:.1e}", loss)
+                self.log(f"val/loss_ema/sigma_{sigma_value:.1e}", loss_ema)
                 total_loss += loss
+                total_loss_ema += loss_ema
             total_loss /= len(self.validation_sigmas)
-            self.log("loss/val", total_loss, prog_bar=True)
+            total_loss_ema /= len(self.validation_sigmas)
+            self.log("val/loss", total_loss, prog_bar=True)
+            self.log("val/loss_ema", total_loss_ema, prog_bar=True)
 
         # Compute validation log-likelihoods.
         if self.validation_nll_fn is not None:
             nll = self.validation_nll_fn(x_batch).mean()
-            self.log("nll/val", nll, prog_bar=True)
+            self.log("val/nll", nll, prog_bar=True)
 
     # --- Lightning module methods: end ---------------------------------------

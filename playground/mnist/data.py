@@ -50,7 +50,9 @@ def create_dataloaders(
 
 def get_image_grid(trajectory: Tensor, step: int, nrows: int = 4, ncols: int = 4, padding: int = 2):
     """Returns a grid of images for the given step of the trajectory."""
-    image_batch = (trajectory[step] * 127.5 + 128).to(torch.uint8).squeeze().cpu().numpy()
+    image_batch = (
+        (trajectory[step] * 127.5 + 128).clip(0, 255).to(torch.uint8).squeeze().cpu().numpy()
+    )
     # Pad images with white pixels.
     image_batch = np.pad(
         image_batch, pad_width=((0, 0), (padding, padding), (padding, padding)), constant_values=255
