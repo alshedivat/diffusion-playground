@@ -834,11 +834,14 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
 
         return x_hat, y_hat
 
-    def _euler_step(self, x: Tensor, dx: Tensor, y: Tensor, ode: BaseDiffEq) -> Tensor:
+    def _euler_step(
+        self, x: Tensor, dx: Tensor, y_tuple: tuple[Tensor, ...], ode: BaseDiffEq
+    ) -> tuple[Tensor, ...]:
         """Computes Euler step after injecting noise."""
+        y = y_tuple[0]
         x_hat, y_hat = self._inject_noise(x, y, ode)
         dx = dx + x - x_hat  # Adjust dx to account for noise injection.
-        return super()._euler_step(x_hat, dx, y_hat, ode)
+        return super()._euler_step(x_hat, dx, (y_hat,), ode)
 
     def _solve(
         self, x: Tensor, y0_tuple: tuple[Tensor, ...], ode: BaseDiffEq
