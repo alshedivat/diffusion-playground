@@ -104,30 +104,34 @@ class KarrasOptimalDenoiser(Denoiser):
     Reference: https://arxiv.org/abs/2206.00364.
     """
 
-    def __init__(self, train_data, sigma_data):
+    def __init__(self, train_dataloader, sigma_data):
         super().__init__()
-        self.train_data = train_data
+        self.train_dataloader = train_dataloader
         self.sigma_data = sigma_data
 
     @staticmethod
     def _normal_prob(x, mu, sigma):
-        batch_size = x.shape[0]
+        # shape: [batch_size_x, batch_size_mu, ...]
         prob_per_dim = torch.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * (2 * torch.pi) ** 0.5)
-        return torch.prod(prob_per_dim.view(batch_size, -1), dim=-1, keepdim=True)
+        # shape: [batch_size_x, batch_size_mu]
+        return torch.prod(prob_per_dim.view(*prob_per_dim.shape[:2], -1), dim=-1)
 
     @torch.no_grad()
     def forward(self, input, sigma, **kwargs):
         del kwargs  # Unused.
         sigma = utils.expand_dims(sigma, input.ndim)
 
-        # Iterate over training data and compute the optimal denoised output for the given sigma.
+        # Iterate over training data and compute the optimal denoised output.
         output = torch.zeros_like(input)
         normalization = torch.zeros_like(sigma)
-        for y_i, *_ in self.train_data:
-            y_i = y_i.unsqueeze(0).to(input.device)
-            p_i = self._normal_prob(input, y_i, sigma)
-            output += y_i * utils.expand_dims(p_i, y_i.ndim)
-            normalization += p_i
+        input = input.unsqueeze(1)  # shape: [batch, 1, ...]
+        sigma = sigma.unsqueeze(1)  # shape: [batch, 1, ...]
+        for y_batch, *_ in self.train_dataloader:
+            y_batch = y_batch.unsqueeze(0).to(input.device)  # shape: [1, batch, ...]
+            p_batch = self._normal_prob(input, y_batch, sigma)  # shape: [batch, batch]
+            p_batch = utils.expand_dims(p_batch, y_batch.ndim)  # shape: [batch, batch, ...]
+            output += (y_batch * p_batch).sum(dim=1)  # shape: [batch, ...]
+            normalization += p_batch.sum(dim=1)  # shape: [batch, ...]
         output /= normalization
 
         return output
