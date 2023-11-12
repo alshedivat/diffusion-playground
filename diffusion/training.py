@@ -421,8 +421,9 @@ class DiffusionModel(pl.LightningModule):
             total_loss = 0.0
             total_loss_ema = 0.0
             batch_size = x_batch.shape[0]
+            sigma = torch.empty((batch_size,), device=x_batch.device)
             for sigma_value in self.validation_sigmas:
-                sigma = torch.full((batch_size,), sigma_value, device=x_batch.device)
+                sigma.fill_(sigma_value)
                 loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, n_batch, sigma)
                 loss_ema = self.loss_fn(
                     self.model_ema, self.val_loss_weight_fn, x_batch, n_batch, sigma
