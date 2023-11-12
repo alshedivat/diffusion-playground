@@ -4,12 +4,25 @@
 
 This repository includes the following:
 - `diffusion` package that provides a clean, modular, and minimalistic implementation of different components and algorithms used in diffusion-based generative modeling (with references to key papers), and
-- `playground` folder that contains a collection of concrete examples that demonstrate diffusion-based generative modeling on different kinds of data (2D points, MNIST, CIFAR10, 3D point clouds, etc.)
+- `playground` folder that contains a collection of examples that demonstrate diffusion-based generative modeling on different kinds of data (2D points, MNIST, CIFAR10, 3D point clouds, etc.)
 
 
 ## Diffusion
 
-TODO: describe package structure
+The package consists of three core modules:
+1. `denoisers` module provides:
+    - `KarrasDenoiser`: A thin wrapper around arbitrary neural nets that enable preconditioning of inputs and outputs, as proposed by [Karras et al., (2022)](https://arxiv.org/abs/2206.00364). The wrapper is agnostic to model architectures and only expects the shape of input and output tensors to match.
+    - `KarrasOptimalDenoiser`: The optimal denoiser that corresponds to the analytical minimum of the denoising loss for a given training dataset.
+2. `training` module provides functionality for training diffusion models:
+    - **Loss functions ([code](https://github.com/alshedivat/diffusion-playground/blob/a58c2f68e9f76c6a056f41067a85d130dbafc4f2/diffusion/training.py#L61-L63)):** provides denoising MSE loss functions, including the original simple denoising loss of [Ho et al. (2020)](https://arxiv.org/abs/2006.11239) and preconditioned MSE loss of [Karras et al., (2022)](https://arxiv.org/abs/2206.00364).
+    - **Loss weighting schemes ([code](https://github.com/alshedivat/diffusion-playground/blob/a58c2f68e9f76c6a056f41067a85d130dbafc4f2/diffusion/training.py#L18-L24)):** a collection of weighting schemes that assign different weights to losses computed for different noise levels, including the SNR-based weighting proposed by [Hang et al. (2022)](https://arxiv.org/abs/2303.09556).
+    - **Noise level samplers ([code](https://github.com/alshedivat/diffusion-playground/blob/a58c2f68e9f76c6a056f41067a85d130dbafc4f2/diffusion/training.py#L124-L130)):** determine how noise levels are sampled during training at each step; the denoising loss is computed for the sampled noise levels, averaged, and optimized w.r.t. model parameters.
+    - **Lightning model ([code](https://github.com/alshedivat/diffusion-playground/blob/a58c2f68e9f76c6a056f41067a85d130dbafc4f2/diffusion/training.py#L262-L264)):** a `LightningModule` class that puts all pieces together and enables training denoising models using [Pytorch Lightning](https://lightning.ai/docs/pytorch/stable/).
+3. `inference` modules provides functionality for sampling from trained diffusion models:
+    - **Noise schedules ([code](https://github.com/alshedivat/diffusion-playground/blob/7ae5c6d5213dff75362b514d1f430f2f13fa1aab/diffusion/inference.py#L23-L28))**
+    - **ODEs ([code](https://github.com/alshedivat/diffusion-playground/blob/7ae5c6d5213dff75362b514d1f430f2f13fa1aab/diffusion/inference.py#L132-L142))**
+    - **Solvers ([code](https://github.com/alshedivat/diffusion-playground/blob/7ae5c6d5213dff75362b514d1f430f2f13fa1aab/diffusion/inference.py#L341-L343))**
+  
 
 
 ## Playground
