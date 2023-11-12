@@ -1,5 +1,6 @@
 """Denoising models."""
 import abc
+import math
 
 import torch
 
@@ -110,28 +111,36 @@ class KarrasOptimalDenoiser(Denoiser):
         self.sigma_data = sigma_data
 
     @staticmethod
-    def _normal_prob(x, mu, sigma):
+    def _log_normal_prob(x, mu, sigma):
         # shape: [batch_size_x, batch_size_mu, ...]
-        prob_per_dim = torch.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * (2 * torch.pi) ** 0.5)
+        log_prob_per_dim = (
+            -0.5 * ((x - mu) / sigma) ** 2 - torch.log(sigma) - 0.5 * math.log(2 * math.pi)
+        )
         # shape: [batch_size_x, batch_size_mu]
-        return torch.prod(prob_per_dim.view(*prob_per_dim.shape[:2], -1), dim=-1)
+        return torch.sum(log_prob_per_dim.view(*log_prob_per_dim.shape[:2], -1), dim=-1)
 
     @torch.no_grad()
     def forward(self, input, sigma, **kwargs):
         del kwargs  # Unused.
-        sigma = utils.expand_dims(sigma, input.ndim)
 
-        # Iterate over training data and compute the optimal denoised output.
-        output = torch.zeros_like(input)
-        normalization = torch.zeros_like(sigma)
+        output = torch.zeros_like(input)  # shape: [batch, ...]
         input = input.unsqueeze(1)  # shape: [batch, 1, ...]
-        sigma = sigma.unsqueeze(1)  # shape: [batch, 1, ...]
+        sigma = utils.expand_dims(sigma, input.ndim)  # shape: [batch, 1, ...]
+
+        # Compute log normalizing constant.
+        log_z = torch.full_like(sigma, -torch.inf)  # shape: [batch, 1, ...]
         for y_batch, *_ in self.train_dataloader:
             y_batch = y_batch.unsqueeze(0).to(input.device)  # shape: [1, batch, ...]
-            p_batch = self._normal_prob(input, y_batch, sigma)  # shape: [batch, batch]
-            p_batch = utils.expand_dims(p_batch, y_batch.ndim)  # shape: [batch, batch, ...]
+            log_p_batch = self._log_normal_prob(input, y_batch, sigma)  # shape: [batch, batch]
+            log_p = utils.expand_dims(torch.logsumexp(log_p_batch, dim=1), log_z.ndim)
+            log_z = torch.logaddexp(log_z, log_p)  # shape: [batch, 1, ...]
+
+        # Iterate over training data and compute the optimal denoised output.
+        for y_batch, *_ in self.train_dataloader:
+            y_batch = y_batch.unsqueeze(0).to(input.device)  # shape: [1, batch, ...]
+            log_p_batch = self._log_normal_prob(input, y_batch, sigma)  # shape: [batch, batch]
+            log_p_batch = utils.expand_dims(log_p_batch, y_batch.ndim)  # shape: [batch, batch, ...]
+            p_batch = torch.exp(log_p_batch - log_z)  # shape: [batch, batch, ...]
             output += (y_batch * p_batch).sum(dim=1)  # shape: [batch, ...]
-            normalization += p_batch.sum(dim=1)  # shape: [batch, ...]
-        output /= normalization
 
         return output
