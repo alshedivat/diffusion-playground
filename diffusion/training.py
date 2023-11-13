@@ -3,20 +3,12 @@ import abc
 import copy
 import functools
 import math
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import pytorch_lightning as pl
 import torch
 
 from diffusion.denoisers import Denoiser, KarrasDenoiser, KarrasOptimalDenoiser
-from diffusion.inference import (
-    BaseDiffEq,
-    BaseDiffEqSolver,
-    BaseNoiseSchedule,
-    DivDiffEq,
-    neg_log_likelihood,
-)
 from diffusion.utils import expand_dims
 
 Tensor = torch.Tensor
@@ -440,18 +432,18 @@ class DiffusionModel(pl.LightningModule):
                         )
                     loss -= self.validation_optimal_loss_cache[optimal_loss_idx]
                     loss_ema -= self.validation_optimal_loss_cache[optimal_loss_idx]
-                self.log(f"val/loss/sigma_{sigma_value:.1e}", loss)
-                self.log(f"val/loss_ema/sigma_{sigma_value:.1e}", loss_ema)
+                self.log(f"val/loss/sigma_{sigma_value:.1e}", loss, sync_dist=True)
+                self.log(f"val/loss_ema/sigma_{sigma_value:.1e}", loss_ema, sync_dist=True)
                 total_loss += loss
                 total_loss_ema += loss_ema
             total_loss /= len(self.validation_sigmas)
             total_loss_ema /= len(self.validation_sigmas)
-            self.log("val/loss", total_loss, prog_bar=True)
-            self.log("val/loss_ema", total_loss_ema, prog_bar=True)
+            self.log("val/loss", total_loss, prog_bar=True, sync_dist=True)
+            self.log("val/loss_ema", total_loss_ema, prog_bar=True, sync_dist=True)
 
         # Compute validation log-likelihoods.
         if self.validation_nll_fn is not None:
             nll = self.validation_nll_fn(x_batch).mean()
-            self.log("val/nll", nll, prog_bar=True)
+            self.log("val/nll", nll, prog_bar=True, sync_dist=True)
 
     # --- Lightning module methods: end ---------------------------------------
