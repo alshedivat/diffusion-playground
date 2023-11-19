@@ -37,6 +37,7 @@ Both training and inference can comfortably run on a laptop (it takes a minute o
 
 Colab notebook: (TODO: add link to the notebook)
 
+
 ### 2. MNIST diffusion
 
 Another toy example, where diffusion model is trained on MNIST.
@@ -45,5 +46,16 @@ It takes about 1 hour to train an MNIST denoiser in Google Colab using a T4 GPU 
 And running inference takes just a few seconds.
 
 <p align="center"><img src="./assets/mnist-diffusion.gif" width="700px" /></p>
+
+Colab notebook: (TODO: add link to the notebook)
+
+
+### 3. CIFAR10 diffusion
+
+In this example, we train U-net diffusion model on CIFAR10 benchmark.
+The model can be trained using `playground/cifar10/train.py` script (takes a few days to train on multiple GPUs), using the architecture and the best hyperparameters given by Karras et al. (2022).
+Running inference takes just a few seconds, and can be done using different ODE solvers.
+
+<p align="center"><img src="./assets/cifar10-diffusion.gif" width="700px" /></p>
 
 Colab notebook: (TODO: add link to the notebook)
