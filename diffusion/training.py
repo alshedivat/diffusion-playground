@@ -323,15 +323,16 @@ class DiffusionModel(pl.LightningModule):
         ema_schedule: EMAWarmupSchedule,
         optimizer_cls: type[torch.optim.Optimizer],
         optimizer_kwargs: dict[str, Any],
-        lr_scheduler_cls: type[torch.optim.lr_scheduler._LRScheduler] | None = None,
+        lr_scheduler_cls: type[torch.optim.lr_scheduler.LRScheduler] | None = None,
         lr_scheduler_kwargs: dict[str, Any] | None = None,
+        lr_scheduler_interval: str | None = None,
         lr_scheduler_monitor: str | None = None,
     ):
         super().__init__()
 
         # Save model and create EMA version.
         self.model = model
-        self.model_ema = copy.deepcopy(model)
+        self.model_ema = copy.deepcopy(model).eval().requires_grad_(False)
 
         # Save loss and weight functions, noise sampler, and EMA schedule.
         self.loss_fn = loss_fn
@@ -348,6 +349,7 @@ class DiffusionModel(pl.LightningModule):
             self._lr_scheduler_builder = functools.partial(
                 lr_scheduler_cls, **(lr_scheduler_kwargs or {})
             )
+        self._lr_scheduler_interval = lr_scheduler_interval or "epoch"
         self._lr_scheduler_monitor = lr_scheduler_monitor or "val/loss"
 
     def setup_validation(
@@ -380,19 +382,28 @@ class DiffusionModel(pl.LightningModule):
         else:
             return {
                 "optimizer": optimizer,
-                "lr_scheduler": lr_scheduler,
-                "monitor": self._lr_scheduler_monitor,
+                "lr_scheduler": {
+                    "scheduler": lr_scheduler,
+                    "interval": self._lr_scheduler_interval,
+                    "monitor": self._lr_scheduler_monitor,
+                },
             }
 
     def optimizer_step(self, *args, **kwargs):
         """Updates model parameters and EMA model parameters."""
         super().optimizer_step(*args, **kwargs)
-        # Log learning rate.
-        self.log("lr", self.current_lr, prog_bar=True)
+        # Remove NaNs from gradients.
+        for param in self.parameters():
+            if param.grad is not None:
+                torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
         # Update EMA model.
         ema_decay = self.ema_schedule.get_value()
         ema_update(self.model, self.model_ema, ema_decay)
         self.ema_schedule.step()
+        # Log learning rate.
+        self.log("lr", self.current_lr, on_step=True, on_epoch=False, prog_bar=True)
+        # Log EMA decay rate.
+        self.log("ema_decay", ema_decay, on_step=True, on_epoch=False, prog_bar=True)
 
     def training_step(self, batch: list[Tensor], batch_idx: int) -> Tensor:
         """Samples noise level and computes loss."""
@@ -401,7 +412,7 @@ class DiffusionModel(pl.LightningModule):
         batch_size = x_batch.shape[0]
         sigma = self.sigma_sampler(batch_size, device=x_batch.device)
         loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, n_batch, sigma)
-        self.log("train/loss", loss, prog_bar=True)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
