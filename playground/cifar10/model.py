@@ -12,6 +12,9 @@ The code in this file is licensed under CC BY-NC-SA 4.0:
 | You should have received a copy of the license along with this
 | work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/.
 """
+import pickle
+import sys
+
 import numpy as np
 import torch
 from torch.nn.functional import silu
@@ -690,3 +693,24 @@ class DhariwalUNet(torch.nn.Module):
             x = block(x, emb)
         x = self.out_conv(silu(self.out_norm(x)))
         return x
+
+
+# ----------------------------------------------------------------------------
+# Utils for loading models.
+# ----------------------------------------------------------------------------
+
+
+def load_edm_model(ckeckpoint_path: str, edm_lib_path: str):
+    """Loads a model trained using the original EDM codebase.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file.
+        edm_lib_path: Path to the EDM library.
+
+    Returns:
+        A torch.nn.Module that represents the EMA of the trained model.
+    """
+    sys.path.append(edm_lib_path)
+    with open(ckeckpoint_path, "rb") as fp:
+        ckpt = pickle.load(fp)
+    return ckpt["ema"]
