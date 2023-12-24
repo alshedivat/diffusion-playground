@@ -8,6 +8,7 @@ from typing import Callable
 import sympy
 import torch
 from torchdiffeq import odeint
+from tqdm import tqdm
 
 from diffusion import utils
 from diffusion.denoisers import Denoiser
@@ -884,7 +885,7 @@ class KarrasStochasticDiffEqSolver(BaseDiffEqSolver):
 
 
 @torch.no_grad()
-def sample(
+def sample_batch(
     input_shape: tuple[int, ...],
     ode: BaseDiffEq,
     solver: BaseDiffEqSolver,
@@ -912,6 +913,35 @@ def sample(
     trajectory_tuple = solver.solve(x, y0_tuple=(y0,), ode=ode)
 
     return trajectory_tuple[0]
+
+
+def generate(
+    n_samples: int,
+    input_shape: tuple[int, ...],
+    ode: BaseDiffEq,
+    solver: BaseDiffEqSolver,
+    noise_schedule: BaseNoiseSchedule,
+    batch_size: int,
+    n_steps: int,
+    device="cpu",
+) -> Tensor:
+    """Generates the specified number of samples."""
+    sample_batches = []
+    n_batches = n_samples // batch_size + (0 if n_samples % batch_size == 0 else 1)
+    for i in tqdm(range(0, n_samples, batch_size), total=n_batches, desc="Sampling batches"):
+        batch_size_i = min(batch_size, n_samples - i)
+        trajectory_batch = sample_batch(
+            input_shape=input_shape,
+            ode=ode,
+            solver=solver,
+            noise_schedule=noise_schedule,
+            batch_size=batch_size_i,
+            n_steps=n_steps,
+            device=device,
+        )
+        sample_batches.append(trajectory_batch[-1].detach().cpu())
+    samples = torch.cat(sample_batches, dim=0)
+    return samples
 
 
 @torch.no_grad()
