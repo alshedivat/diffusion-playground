@@ -1,6 +1,7 @@
 """PyTorch Lightning API for training and inference."""
 import copy
 import functools
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -323,5 +324,17 @@ class LightningDiffusion(L.LightningModule):
         else:
             # Return final sample in the trajectory.
             return trajectory[-1]
+
+    def on_predict_epoch_end(self):
+        """Gathers predictions from all processes and terminates worker processes, if needed."""
+        if self.trainer.num_devices > 1:
+            predictions = self.all_gather(self.trainer.predict_loop.predictions)
+            if self.trainer.is_global_zero:
+                # Flatten predictions.
+                predictions = [torch.flatten(p, end_dim=1) for p in predictions]
+                self.trainer.predict_loop._predictions = [predictions]
+            else:
+                # Make worker processes exit.
+                sys.exit()
 
     # --- Lightning module methods: end ---------------------------------------

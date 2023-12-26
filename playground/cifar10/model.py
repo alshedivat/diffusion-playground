@@ -12,6 +12,7 @@ The code in this file is licensed under CC BY-NC-SA 4.0:
 | You should have received a copy of the license along with this
 | work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/.
 """
+import os
 import pickle
 import sys
 
@@ -710,7 +711,7 @@ def load_edm_model(ckeckpoint_path: str, edm_lib_path: str):
     Returns:
         A torch.nn.Module that represents the EMA of the trained model.
     """
-    sys.path.append(edm_lib_path)
+    sys.path.append(os.path.expandvars(edm_lib_path))
     with open(ckeckpoint_path, "rb") as fp:
         ckpt = pickle.load(fp)
     return ckpt["ema"]

@@ -5,8 +5,8 @@ import torch
 from aim.pytorch_lightning import AimLogger
 from augment import AugmentPipe
 from data import create_dataloaders, load_data
+from L.callbacks import ModelCheckpoint
 from model import SongUNet
-from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.optim.lr_scheduler import LRScheduler
 
 from diffusion.denoisers import KarrasDenoiser
