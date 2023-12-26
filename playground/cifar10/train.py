@@ -1,6 +1,6 @@
 """Script for training a diffusion model on CIFAR10 data."""
 import click
-import pytorch_lightning as pl
+import lightning as L
 import torch
 from aim.pytorch_lightning import AimLogger
 from augment import AugmentPipe
@@ -9,11 +9,14 @@ from model import SongUNet
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.optim.lr_scheduler import LRScheduler
 
-from diffusion.denoisers import KarrasDenoiser, KarrasOptimalDenoiser
+from diffusion.denoisers import KarrasDenoiser
+from diffusion.lightning import (
+    DiffusionDatasetWrapper,
+    LightningDiffusion,
+    TrainingConfig,
+)
 from diffusion.training import (
     WEIGHTING_SCHEMES,
-    DiffusionDatasetWrapper,
-    DiffusionModel,
     EMAWarmupSchedule,
     KarrasLossFn,
     LogNormalNoiseSampler,
@@ -77,7 +80,7 @@ def main(
     sigma_data,
     seed,
 ):
-    pl.seed_everything(seed)
+    L.seed_everything(seed)
     torch.backends.cudnn.benchmark = True
     if mixed_precision:
         torch.set_float32_matmul_precision("high")
@@ -94,11 +97,6 @@ def main(
     )
 
     # Instantiate and compile diffusion model.
-    optimizer_cls = torch.optim.Adam
-    optimizer_kwargs = {"lr": lr, "betas": [0.9, 0.999], "eps": 1e-8}
-    lr_scheduler_cls = WarmupLRScheduler
-    lr_scheduler_kwargs = {"warmup_steps": 20_000}
-
     unet = SongUNet(
         img_resolution=32,
         in_channels=3,
@@ -129,29 +127,25 @@ def main(
             translate_frac=1,
         )
         unet = AugmentModelWrapper(unet, augment_pipe)
-
     model = KarrasDenoiser(model=unet, sigma_data=sigma_data)
-    loss_fn = KarrasLossFn()
-    loss_weight_fn = WEIGHTING_SCHEMES[loss_weighting]
-    sigma_sampler = LogNormalNoiseSampler(loc=-1.2, scale=1.2)
-    ema_schedule = EMAWarmupSchedule(inv_gamma=1.0, power=0.6, max_value=0.9999)
-    diffusion = DiffusionModel(
-        model=model,
-        loss_fn=loss_fn,
-        loss_weight_fn=loss_weight_fn,
-        sigma_sampler=sigma_sampler,
-        ema_schedule=ema_schedule,
-        optimizer_cls=optimizer_cls,
-        optimizer_kwargs=optimizer_kwargs,
-        lr_scheduler_cls=lr_scheduler_cls,
-        lr_scheduler_kwargs=lr_scheduler_kwargs,
+
+    # Create training config.
+    training_config = TrainingConfig(
+        loss_fn=KarrasLossFn(),
+        loss_weight_fn=WEIGHTING_SCHEMES[loss_weighting],
+        sigma_sampler=LogNormalNoiseSampler(loc=-1.2, scale=1.2),
+        ema_schedule=EMAWarmupSchedule(inv_gamma=1.0, power=0.6, max_value=0.9999),
+        optimizer_cls=torch.optim.Adam,
+        optimizer_kwargs={"lr": lr, "betas": [0.9, 0.999], "eps": 1e-8},
+        lr_scheduler_cls=WarmupLRScheduler,
+        lr_scheduler_kwargs={"warmup_steps": 20_000},
         lr_scheduler_interval="step",
-    )
-    diffusion.setup_validation(
         validation_sigmas=[1e-3, 1e-2, 1e-1, 1e0],
         # validation_optimal_denoiser=KarrasOptimalDenoiser(val_loader, sigma_data),
     )
 
+    # Train model.
+    diffusion = LightningDiffusion(model=model, training_config=training_config)
     aim_logger = AimLogger(
         experiment="CIFAR10-diffusion",
         train_metric_prefix="train/",
@@ -165,7 +159,7 @@ def main(
         save_top_k=1,
         save_last=True,
     )
-    trainer = pl.Trainer(
+    trainer = L.Trainer(
         accelerator="cuda",
         devices=n_gpus,
         strategy="ddp",
