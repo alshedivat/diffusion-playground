@@ -60,7 +60,7 @@ class AugmentModelWrapper(torch.nn.Module):
 @click.option("--dropout_prob", default=0.13, help="Dropout probability.")
 @click.option("--lr", default=1e-3, help="Learning rate.")
 @click.option("--loss_weighting", default="uniform", help="Name of the loss weighting scheme.")
-@click.option("--mixed-precision", is_flag=True, default=False, help="Enable mixed precision.")
+@click.option("--mixed_precision", is_flag=True, default=False, help="Enable mixed precision.")
 @click.option("--n_workers", default=16, help="Number of workers for data loading.")
 @click.option("--n_steps", default=400_000, help="Number of training steps.")
 @click.option("--n_gpus", default=4, help="Number of GPUs to train on.")
