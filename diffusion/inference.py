@@ -884,6 +884,7 @@ class KarrasNoiseSchedule(BaseNoiseSchedule):
     def get_logsnr_schedule(self, n: int, device: str) -> tuple[Tensor, Tensor]:
         """Rerturns a tensor of log-SNR steps computed from sigma."""
         sigma, sigma0 = self.get_sigma_schedule(n, device=device)
+        sigma[-1] = 1e-8  # Avoid division by zero.
         return 2 * torch.log(self.sigma_data / sigma), sigma0
 
 
