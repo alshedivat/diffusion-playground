@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
-import lightning as L
+import pytorch_lightning as pl
 import torch
 
 from diffusion.denoisers import Denoiser, KarrasOptimalDenoiser
@@ -141,7 +141,7 @@ class InferenceConfig:
     return_trajectory: bool = False
 
 
-class LightningDiffusion(L.LightningModule):
+class LightningDiffusion(pl.LightningModule):
     """A Pytorch Lightning module for denoising diffusion training and inference.
 
     Args:
@@ -168,7 +168,7 @@ class LightningDiffusion(L.LightningModule):
 
     def setup_training(self, training_config: TrainingConfig):
         self.training_config = training_config
-        if training_config is None:
+        if self.training_config is None:
             return
 
         # Save loss and weight functions, noise sampler, and EMA schedule.
@@ -201,6 +201,8 @@ class LightningDiffusion(L.LightningModule):
 
     def setup_inference(self, inference_config: InferenceConfig):
         self.inference_config = inference_config
+        if self.inference_config is None:
+            return
 
         self.inference_ode = inference_config.ode_builder(self.model_ema)
         self.inference_solver = inference_config.solver

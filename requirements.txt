@@ -2,9 +2,9 @@ aim
 clean-fid
 click
 einops
-lightning
 matplotlib
 numpy
+pytorch-lightning
 scikit-learn
 seaborn
 sympy

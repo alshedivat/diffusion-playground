@@ -1,9 +1,10 @@
 """Script for sampling from a pretrained diffusion model on CIFAR10 data."""
 import functools
 import os
+from enum import Enum
 
 import click
-import lightning as L
+import pytorch_lightning as pl
 import torch
 from model import load_edm_model
 from PIL import Image
@@ -21,6 +22,21 @@ from diffusion.lightning import (
     LightningDiffusion,
     StandardNormalNoiseDataset,
 )
+
+
+class ODEType(str, Enum):
+    KARRAS = "karras"
+    LOGSNR = "logsnr"
+
+
+class SolverType(str, Enum):
+    KARRAS_HEUN2 = "karras_heun2"
+    DPMPP_M2 = "dpmpp_m2"
+
+
+class NoiseScheduleType(str, Enum):
+    KARRAS = "karras"
+    LINEAR_LOGSNR = "linear_logsnr"
 
 
 def save_images(samples_batch, start_index: int, dir_path: str):
@@ -45,19 +61,19 @@ def save_images(samples_batch, start_index: int, dir_path: str):
 @click.option("--edm_lib_path", default="$HOME/edm/", help="Path to the EDM library.")
 @click.option(
     "--ode_type",
-    type=click.Choice(["karras_time", "karras_logsnr"]),
+    type=click.Choice([*ODEType]),
     default="karras_time",
     help="Type of the ODE to use for sampling.",
 )
 @click.option(
     "--solver_type",
-    type=click.Choice(["karras_heun2", "dpmpp_m2"]),
+    type=click.Choice([*SolverType]),
     default="karras_heun2",
     help="Type of the solver to use for sampling.",
 )
 @click.option(
     "--noise_schedule_type",
-    type=click.Choice(["karras", "linear_logsnr"]),
+    type=click.Choice([*NoiseScheduleType]),
     default="karras",
     help="Type of the noise schedule to use for sampling.",
 )
@@ -78,7 +94,7 @@ def main(
     n_gpus,
     seed,
 ):
-    L.seed_everything(seed, workers=True)
+    pl.seed_everything(seed, workers=True)
     if mixed_precision:
         torch.set_float32_matmul_precision("high")
 
@@ -98,31 +114,31 @@ def main(
         denoiser.use_fp16 = True
 
     # Select ODE.
-    if ode_type == "karras_time":
+    if ode_type == ODEType.KARRAS:
         ode_builder = functools.partial(
             KarrasDiffEq,
             t_to_sigma=lambda t: t,
             sigma_to_t=lambda sigma: sigma,
         )
-    elif ode_type == "karras_logsnr":
+    elif ode_type == ODEType.LOGSNR:
         ode_builder = LogSnrDiffEq
     else:
         raise ValueError(f"Unknown ODE type: {ode_type}")
 
     # Select solver.
-    if solver_type == "karras_heun2":
+    if solver_type == SolverType.KARRAS_HEUN2:
         solver = KarrasHeun2Solver()
-    elif solver_type == "dpmpp_m2":
+    elif solver_type == SolverType.DPMPP_M2:
         solver = DPMppDiffEqSolver(order=2, multistep=True)
     else:
         raise ValueError(f"Unknown solver type: {solver_type}")
 
     # Select noise schedule.
-    if noise_schedule_type == "karras":
+    if noise_schedule_type == NoiseScheduleType.KARRAS:
         noise_schedule = KarrasNoiseSchedule(
             sigma_data=0.5, sigma_min=0.002, sigma_max=80.0, rho=7.0
         )
-    elif noise_schedule_type == "logsnr_linear":
+    elif noise_schedule_type == NoiseScheduleType.LINEAR_LOGSNR:
         noise_schedule = LinearLogSnrNoiseSchedule(
             sigma_data=0.5, logsnr_min=-10.0, logsnr_max=10.0
         )
@@ -138,7 +154,7 @@ def main(
         return_trajectory=False,
     )
     inference_model = LightningDiffusion(model=denoiser, inference_config=inference_config)
-    inference_runner = L.Trainer(
+    inference_runner = pl.Trainer(
         accelerator="gpu",
         devices=n_gpus,
         precision="16-mixed" if mixed_precision else "32",

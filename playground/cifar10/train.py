@@ -1,11 +1,10 @@
 """Script for training a diffusion model on CIFAR10 data."""
 import click
-import lightning as L
+import pytorch_lightning as pl
 import torch
 from aim.pytorch_lightning import AimLogger
 from augment import AugmentPipe
 from data import create_dataloaders, load_data
-from L.callbacks import ModelCheckpoint
 from model import SongUNet
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -80,7 +79,7 @@ def main(
     sigma_data,
     seed,
 ):
-    L.seed_everything(seed)
+    pl.seed_everything(seed)
     torch.backends.cudnn.benchmark = True
     if mixed_precision:
         torch.set_float32_matmul_precision("high")
@@ -152,14 +151,14 @@ def main(
         test_metric_prefix="test/",
         val_metric_prefix="val/",
     )
-    callback = ModelCheckpoint(
+    callback = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
         monitor="val/loss",
         mode="min",
         save_top_k=1,
         save_last=True,
     )
-    trainer = L.Trainer(
+    trainer = pl.Trainer(
         accelerator="cuda",
         devices=n_gpus,
         strategy="ddp",
