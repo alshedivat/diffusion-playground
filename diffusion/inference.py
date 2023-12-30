@@ -41,7 +41,22 @@ class DiffEqDomain(str, Enum):
 
 
 class BaseDiffEq(abc.ABC):
-    """Abstract base class for ODEs."""
+    """Abstract base class for ODEs.
+
+    Args:
+        denoiser: A denoising model.
+    """
+
+    def __init__(self, denoiser: Denoiser) -> None:
+        self.denoiser = denoiser
+        self._condition_labels = None
+
+    @property
+    def condition_labels(self) -> Tensor | None:
+        return self._condition_labels
+
+    def condition(self, labels: Tensor) -> None:
+        self._condition_labels = labels
 
     @property
     @abc.abstractmethod
@@ -80,8 +95,10 @@ class KarrasDiffEq(BaseDiffEq):
 
     Args:
         denoiser: A denoising model.
-        t_to_sigma: An element-wise function that maps t to sigma.
-        sigma_to_t: An element-wise function that maps sigma to t.
+        t_to_sigma: An optional element-wise function that maps t to sigma.
+            If None, assumes sigma(t) = t.
+        sigma_to_t: An optional element-wise function that maps sigma to t.
+            If None, assumes t(sigma) = sigma.
 
     NOTE:
         Karras et al. (2022) also defined a version of the ODE with
@@ -95,10 +112,10 @@ class KarrasDiffEq(BaseDiffEq):
     def __init__(
         self,
         denoiser: Denoiser,
-        t_to_sigma: Callable[[Tensor], Tensor],
-        sigma_to_t: Callable[[Tensor], Tensor],
+        t_to_sigma: Callable[[Tensor], Tensor] | None = None,
+        sigma_to_t: Callable[[Tensor], Tensor] | None = None,
     ) -> None:
-        self.denoiser = denoiser
+        super().__init__(denoiser)
         self._t_to_sigma = t_to_sigma
         self._sigma_to_t = sigma_to_t
 
@@ -107,10 +124,10 @@ class KarrasDiffEq(BaseDiffEq):
         return DiffEqDomain.TIME
 
     def x_to_sigma(self, x: Tensor) -> Tensor:
-        return self._t_to_sigma(x)
+        return self._t_to_sigma(x) if self._t_to_sigma is not None else x
 
     def sigma_to_x(self, sigma: Tensor) -> Tensor:
-        return self._sigma_to_t(sigma)
+        return self._sigma_to_t(sigma) if self._sigma_to_t is not None else sigma
 
     def dy_dx(self, x: Tensor, y_tuple: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
         """Computes dy/dx for the specified x and y, where x is supposed to be time."""
@@ -125,15 +142,22 @@ class KarrasDiffEq(BaseDiffEq):
         batch_size = y.shape[0]
 
         # Compute sigma and d sigma / dt for each time point in the batch.
-        # NOTE: we assume that sigma_fn is an element-wise function.
-        with torch.enable_grad():
-            t = x.repeat(batch_size).detach().requires_grad_()  # shape: [batch_size]
-            t = utils.expand_dims(t, y.ndim)  # shape: [batch_size, 1, ...]
-            sigma = self.x_to_sigma(t)  # shape: [batch_size, 1, ...]
-            dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1, ...]
+        if self._t_to_sigma is not None:
+            # NOTE: we assume that x_to_sigma is an element-wise function.
+            with torch.enable_grad():
+                t = x.repeat(batch_size).detach().requires_grad_()  # shape: [batch_size]
+                t = utils.expand_dims(t, y.ndim)  # shape: [batch_size, 1, ...]
+                sigma = self.x_to_sigma(t)  # shape: [batch_size, 1, ...]
+                dsigma_dt = torch.autograd.grad(sigma.sum(), t)[0]  # shape: [batch_size, 1, ...]
+        else:
+            # If x_to_sigma is not specified, assume sigma(t) = t, i.e., d sigma / dt = 1.
+            sigma = utils.expand_dims(x.repeat(batch_size), y.ndim)  # shape: [batch_size, 1, ...]
+            dsigma_dt = 1.0
 
         # Compute dy/dx.
-        dy_dx = (dsigma_dt / sigma) * (y - self.denoiser(y, sigma.squeeze()))
+        dy_dx = (dsigma_dt / sigma) * (
+            y - self.denoiser(y, sigma.squeeze(), class_labels=self.condition_labels)
+        )
 
         return (dy_dx,)
 
@@ -147,9 +171,6 @@ class LogSnrDiffEq(BaseDiffEq):
         where x is defined as log-SNR: x := 2 log(sigma_data / sigma), which
         implies that sigma(x) = sigma_data * exp(-x / 2).
     """
-
-    def __init__(self, denoiser: Denoiser) -> None:
-        self.denoiser = denoiser
 
     @property
     def domain(self) -> DiffEqDomain:
@@ -177,7 +198,7 @@ class LogSnrDiffEq(BaseDiffEq):
         sigma = self.x_to_sigma(x).repeat(batch_size)
 
         # Compute dy/dx.
-        dy_dx = (self.denoiser(y, sigma) - y) / 2
+        dy_dx = (self.denoiser(y, sigma, class_labels=self.condition_labels) - y) / 2
 
         return (dy_dx,)
 
@@ -928,14 +949,41 @@ def sample_trajectory_batch(
     noise_schedule: BaseNoiseSchedule,
     batch_size: int,
     n_steps: int,
+    condition_label: int | None = None,
+    condition_dim: int | None = None,
     device="cpu",
 ) -> Tensor:
-    """Generates samples using the specified ODE, solver, and noise schedule."""
+    """Generates a batch of samples using the specified ODE, solver, and noise schedule.
+
+    Args:
+        input_shape: Shape of the input tensor.
+        ode: An ODE that defines the probability flow of the diffusion process.
+        solver: An ODE solver to use for integration.
+        noise_schedule: A noise schedule that defines integration trajectory.
+        batch_size: Number of samples to generate.
+        n_steps: Number of steps in the integration trajectory.
+        condition_label: An optional label to use for conditional sampling.
+        condition_dim: Dimensionality of the condition labels.
+        device: Device to use for integration.
+
+    Returns:
+        A batch of ODE trajectories.
+    """
     # Generate grid.
     x, sigma0 = noise_schedule.get_x_schedule(n_steps, domain=ode.domain, device=device)
 
     # Generate a batch of initial noise.
     y0 = sigma0 * torch.randn((batch_size,) + input_shape, device=device)
+
+    # Condition ODE on the specified label.
+    if condition_label is not None:
+        if condition_dim is None:
+            raise ValueError("condition_dim must be specified when condition is provided.")
+        condition_labels = torch.zeros((batch_size, condition_dim), device=device)
+        condition_labels[:, condition_label] = 1.0
+        ode.condition(condition_labels)
+    else:
+        ode.condition(None)
 
     # Transfer denosing model to the specified device.
     ode.denoiser.to(device)
@@ -944,35 +992,6 @@ def sample_trajectory_batch(
     trajectory_tuple = solver.solve(x, y0_tuple=(y0,), ode=ode)
 
     return trajectory_tuple[0]
-
-
-def generate(
-    n_samples: int,
-    input_shape: tuple[int, ...],
-    ode: BaseDiffEq,
-    solver: BaseDiffEqSolver,
-    noise_schedule: BaseNoiseSchedule,
-    batch_size: int,
-    n_steps: int,
-    device="cpu",
-) -> Tensor:
-    """Generates the specified number of samples."""
-    sample_batches = []
-    n_batches = n_samples // batch_size + (0 if n_samples % batch_size == 0 else 1)
-    for i in tqdm(range(0, n_samples, batch_size), total=n_batches, desc="Sampling batches"):
-        batch_size_i = min(batch_size, n_samples - i)
-        trajectory_batch = sample_trajectory_batch(
-            input_shape=input_shape,
-            ode=ode,
-            solver=solver,
-            noise_schedule=noise_schedule,
-            batch_size=batch_size_i,
-            n_steps=n_steps,
-            device=device,
-        )
-        sample_batches.append(trajectory_batch[-1].detach().cpu())
-    samples = torch.cat(sample_batches, dim=0)
-    return samples
 
 
 @torch.no_grad()
