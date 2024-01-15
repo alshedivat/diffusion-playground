@@ -41,7 +41,7 @@ class StandardNormalNoiseDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return self.size
 
-    def __getitem__(self, index) -> tuple[Tensor]:
+    def __getitem__(self, index) -> dict[str, Tensor]:
         # Generate noise tensor if it is not cached.
         if index not in self.noise_cache:
             noise = torch.randn(self.shape)
@@ -49,7 +49,7 @@ class StandardNormalNoiseDataset(torch.utils.data.Dataset):
                 self.noise_cache[index] = noise
         else:
             noise = self.noise_cache[index]
-        return (noise,)
+        return {"noise": noise}
 
 
 class DiffusionDatasetWrapper(torch.utils.data.Dataset):
@@ -71,14 +71,14 @@ class DiffusionDatasetWrapper(torch.utils.data.Dataset):
 
         # Create noise dataset.
         self.noise_dataset = StandardNormalNoiseDataset(
-            shape=dataset[0][0].shape, size=len(dataset), fixed_noise=fixed_noise
+            shape=dataset[0]["input"].shape, size=len(dataset), fixed_noise=fixed_noise
         )
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index) -> tuple[Tensor, ...]:
-        return tuple(self.dataset[index]) + self.noise_dataset[index]
+    def __getitem__(self, index) -> dict[str, Tensor]:
+        return dict(**self.dataset[index], **self.noise_dataset[index])
 
 
 @dataclass
@@ -116,8 +116,8 @@ class TrainingConfig:
     lr_scheduler_monitor: str | None = None
 
     # Validation.
-    validation_sigmas: list[float] | None = (None,)
-    validation_nll_fn: Callable[[Tensor], Tensor] | None = (None,)
+    validation_sigmas: list[float] | None = None
+    validation_nll_fn: Callable[[Tensor], Tensor] | None = None
     validation_optimal_denoiser: KarrasOptimalDenoiser | None = None
 
 
@@ -252,44 +252,38 @@ class LightningDiffusion(pl.LightningModule):
         # Log EMA decay rate.
         self.log("ema_decay", ema_decay, on_step=True, on_epoch=False, prog_bar=True)
 
-    def training_step(self, batch: list[Tensor], batch_idx: int) -> Tensor:
+    def training_step(self, batch_dict: dict[str, Tensor], batch_idx: int) -> Tensor:
         """Samples noise level and computes loss."""
         del batch_idx  # Unused.
-        x_batch, *_, n_batch = batch
-        batch_size = x_batch.shape[0]
-        sigma = self.sigma_sampler(batch_size, device=x_batch.device)
-        loss = self.loss_fn(self.model, self.train_loss_weight_fn, x_batch, n_batch, sigma)
+        batch_size = batch_dict["input"].shape[0]
+        sigma = self.sigma_sampler(batch_size, device=batch_dict["input"].device)
+        loss = self.loss_fn(self.model, self.train_loss_weight_fn, batch_dict, sigma)
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
-    def validation_step(self, batch: list[Tensor], batch_idx: int) -> None:
+    def validation_step(self, batch_dict: dict[str, Tensor], batch_idx: int) -> None:
         """Computes and logs validation metrics."""
-        x_batch, *_, n_batch = batch
-
         # Compute validation losses for each noise level.
         if self.validation_sigmas is not None:
             total_loss = 0.0
             total_loss_ema = 0.0
-            batch_size = x_batch.shape[0]
-            sigma = torch.empty((batch_size,), device=x_batch.device)
+            batch_size = batch_dict["input"].shape[0]
+            sigma = torch.empty((batch_size,), device=batch_dict["input"].device)
             for sigma_value in self.validation_sigmas:
                 sigma.fill_(sigma_value)
-                loss = self.loss_fn(self.model, self.val_loss_weight_fn, x_batch, n_batch, sigma)
-                loss_ema = self.loss_fn(
-                    self.model_ema, self.val_loss_weight_fn, x_batch, n_batch, sigma
-                )
+                loss = self.loss_fn(self.model, self.val_loss_weight_fn, batch_dict, sigma)
+                loss_ema = self.loss_fn(self.model_ema, self.val_loss_weight_fn, batch_dict, sigma)
                 if self.validation_optimal_denoiser is not None:
                     optimal_loss_idx = (batch_idx, sigma_value)
-                    if optimal_loss_idx not in self.validation_optimal_loss_cache:
-                        self.validation_optimal_loss_cache[optimal_loss_idx] = self.loss_fn(
+                    if optimal_loss_idx not in self._validation_optimal_loss_cache:
+                        self._validation_optimal_loss_cache[optimal_loss_idx] = self.loss_fn(
                             self.validation_optimal_denoiser,
                             self.val_loss_weight_fn,
-                            x_batch,
-                            n_batch,
+                            batch_dict,
                             sigma,
                         )
-                    loss -= self.validation_optimal_loss_cache[optimal_loss_idx]
-                    loss_ema -= self.validation_optimal_loss_cache[optimal_loss_idx]
+                    loss -= self._validation_optimal_loss_cache[optimal_loss_idx]
+                    loss_ema -= self._validation_optimal_loss_cache[optimal_loss_idx]
                 self.log(f"val/loss/sigma_{sigma_value:.1e}", loss, sync_dist=True)
                 self.log(f"val/loss_ema/sigma_{sigma_value:.1e}", loss_ema, sync_dist=True)
                 total_loss += loss
@@ -301,13 +295,19 @@ class LightningDiffusion(pl.LightningModule):
 
         # Compute validation log-likelihoods.
         if self.validation_nll_fn is not None:
-            nll = self.validation_nll_fn(x_batch).mean()
+            nll = self.validation_nll_fn(batch_dict).mean()
             self.log("val/nll", nll, prog_bar=True, sync_dist=True)
 
-    def predict_step(self, batch: list[Tensor], batch_idx: int, dataloader_idx: int = 0) -> Tensor:
+    def predict_step(
+        self, batch_dict: dict[str, Tensor], batch_idx: int, dataloader_idx: int = 0
+    ) -> Tensor:
         """Generates a batch of samples given a batch of noise."""
         del batch_idx, dataloader_idx  # Unused.
-        assert len(batch) == 1, "`batch` must contain only a single tensor with noise."
+
+        if "noise" not in batch_dict or len(batch_dict) == 1:
+            raise ValueError(
+                f"`batch_dict` must contain only a single noise tensor, but got {batch_dict=}."
+            )
 
         # Generate grid.
         x, sigma0 = self.inference_noise_schedule.get_x_schedule(
@@ -315,7 +315,7 @@ class LightningDiffusion(pl.LightningModule):
         )
 
         # Generate initial noisy sample.
-        y0 = sigma0 * batch[0]
+        y0 = sigma0 * batch_dict["noise"]
 
         # Run solver.
         trajectory, *_ = self.inference_solver.solve(x, y0_tuple=(y0,), ode=self.inference_ode)

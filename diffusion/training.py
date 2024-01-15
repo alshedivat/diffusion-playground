@@ -66,7 +66,7 @@ class BaseLossFn(abc.ABC):
 
     @abc.abstractmethod
     def _loss(
-        self, denoiser: Denoiser, input: Tensor, noise: Tensor, sigma: Tensor, **model_kwargs
+        self, denoiser: Denoiser, inputs_dict: dict[str, Tensor], sigma: Tensor, **model_kwargs
     ) -> Tensor:
         """Computes the loss for a batch of inputs. Must be implemented by subclasses."""
 
@@ -74,13 +74,12 @@ class BaseLossFn(abc.ABC):
         self,
         denoiser: Denoiser,
         loss_weight_fn: LossWeightFn,
-        input: Tensor,
-        noise: Tensor,
+        inputs_dict: dict[str, Tensor],
         sigma: Tensor,
         **model_kwargs,
     ) -> Tensor:
         """Computes weighted loss for a batch of inputs."""
-        loss = self._loss(denoiser, input, noise, sigma, **model_kwargs)  # shape: [batch_size]
+        loss = self._loss(denoiser, inputs_dict, sigma, **model_kwargs)  # shape: [batch_size]
         weight = loss_weight_fn(sigma, denoiser.sigma_data)  # shape: [batch_size]
         return (loss * weight).mean()
 
@@ -89,10 +88,12 @@ class SimpleLossFn(BaseLossFn):
     """Computes simple MSE loss between the predicted and true noise from Ho et al. (2020)."""
 
     def _loss(
-        self, denoiser: Denoiser, input: Tensor, noise: Tensor, sigma: Tensor, **model_kwargs
+        self, denoiser: Denoiser, inputs_dict: dict[str, Tensor], sigma: Tensor, **model_kwargs
     ) -> Tensor:
+        inputs_dict = inputs_dict.copy()  # Avoid modifying the original dict.
+        input, noise = inputs_dict.pop("input"), inputs_dict.pop("noise")
         noised_input = input + noise * expand_dims(sigma, input.ndim)
-        denoised_input = denoiser(noised_input, sigma, **model_kwargs)
+        denoised_input = denoiser(noised_input, sigma, **inputs_dict, **model_kwargs)
         eps = (input - denoised_input) / expand_dims(sigma, input.ndim)
         return (eps - noise).pow(2).flatten(1).mean(1)
 
@@ -111,13 +112,14 @@ class KarrasLossFn(BaseLossFn):
     def _loss(
         self,
         denoiser: KarrasDenoiser,
-        input: Tensor,
-        noise: Tensor,
+        inputs_dict: dict[str, Tensor],
         sigma: Tensor,
         **model_kwargs,
     ) -> Tensor:
+        inputs_dict = inputs_dict.copy()  # Avoid modifying the original dict.
+        input, noise = inputs_dict.pop("input"), inputs_dict.pop("noise")
         noised_input = input + noise * expand_dims(sigma, input.ndim)
-        denoised_input = denoiser(noised_input, sigma, **model_kwargs)
+        denoised_input = denoiser(noised_input, sigma, **inputs_dict, **model_kwargs)
         precond = (sigma**2 + denoiser.sigma_data**2) / (sigma * denoiser.sigma_data) ** 2
         return precond * (denoised_input - input).pow(2).flatten(1).mean(1)
 
