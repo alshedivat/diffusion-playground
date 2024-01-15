@@ -39,17 +39,17 @@ class WarmupLRScheduler(LRScheduler):
             return self.base_lrs
 
 
-class AugmentModelWrapper(torch.nn.Module):
-    """Thin wrapper around model that applies augmentation to input."""
+def create_augment_collate_fn(augment_pipe):
+    """A custom collate function that applies augmentation after batch collation."""
 
-    def __init__(self, model, augment_pipe):
-        super().__init__()
-        self.model = model
-        self.augment_pipe = augment_pipe
+    def collate_fn(instance_list):
+        batch_dict = torch.utils.data._utils.collate.default_collate(instance_list)
+        augment_input, augment_labels = augment_pipe(batch_dict.pop("input"))
+        batch_dict["input"] = augment_input
+        batch_dict["augment_labels"] = augment_labels
+        return batch_dict
 
-    def forward(self, input, sigma, **kwargs):
-        augment_input, augment_labels = self.augment_pipe(input)
-        return self.model(augment_input, sigma, augment_labels=augment_labels, **kwargs)
+    return collate_fn
 
 
 @click.command()
@@ -79,20 +79,39 @@ def main(
     sigma_data,
     seed,
 ):
-    pl.seed_everything(seed)
+    pl.seed_everything(seed, workers=True)
     torch.backends.cudnn.benchmark = True
     if mixed_precision:
         torch.set_float32_matmul_precision("high")
 
     # Load data.
-    train_dataset, val_dataset, test_dataset = load_data()
+    train_dataset, test_dataset = load_data()
     train_dataset = DiffusionDatasetWrapper(train_dataset, fixed_noise=False)
-    val_dataset = DiffusionDatasetWrapper(val_dataset, fixed_noise=True)
     test_dataset = DiffusionDatasetWrapper(test_dataset, fixed_noise=True)
 
+    # Augment training data, if necessary.
+    train_collate_fn = None
+    if augment_prob > 0:
+        augment_pipe = AugmentPipe(
+            p=augment_prob,
+            xflip=1e8,
+            yflip=1,
+            scale=1,
+            rotate_frac=1,
+            aniso=1,
+            translate_frac=1,
+        )
+        train_collate_fn = create_augment_collate_fn(augment_pipe)
+
     # Create dataloaders.
-    train_loader, val_loader, test_loader = create_dataloaders(
-        train_dataset, val_dataset, test_dataset, batch_size=batch_size, num_workers=n_workers
+    train_loader, test_loader = create_dataloaders(
+        train_dataset,
+        test_dataset,
+        batch_size=batch_size,
+        num_workers=n_workers,
+        prefetch_factor=2,
+        pin_memory=True,
+        train_collate_fn=train_collate_fn,
     )
 
     # Instantiate and compile diffusion model.
@@ -115,17 +134,6 @@ def main(
         decoder_type="standard",
         resample_filter=[1, 3, 3, 1],
     )
-    if augment_prob > 0:
-        augment_pipe = AugmentPipe(
-            p=augment_prob,
-            xflip=1e8,
-            yflip=1,
-            scale=1,
-            rotate_frac=1,
-            aniso=1,
-            translate_frac=1,
-        )
-        unet = AugmentModelWrapper(unet, augment_pipe)
     model = KarrasDenoiser(model=unet, sigma_data=sigma_data)
 
     # Create training config.
@@ -169,7 +177,7 @@ def main(
         log_every_n_steps=20,
         callbacks=[callback],
     )
-    trainer.fit(diffusion, train_loader, val_loader)
+    trainer.fit(diffusion, train_loader, test_loader)
 
 
 if __name__ == "__main__":
