@@ -1,14 +1,17 @@
 """Script for sampling from a pretrained diffusion model on CIFAR10 data."""
 import functools
 import os
+import pickle
+import sys
 from enum import Enum
 
 import click
 import pytorch_lightning as pl
 import torch
-from model import load_edm_model
+from model import SongUNet
 from PIL import Image
 
+from diffusion.denoisers import KarrasDenoiser
 from diffusion.inference import (
     DPMppDiffEqSolver,
     KarrasDiffEq,
@@ -52,8 +55,59 @@ def save_images(samples_batch, start_index: int, dir_path: str):
         img.save(os.path.join(dir_path, f"{start_index + i}.png"))
 
 
+def load_edm_model(ckeckpoint_path: str, edm_lib_path: str):
+    """Loads a model trained using the original EDM codebase.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file.
+        edm_lib_path: Path to the EDM library.
+
+    Returns:
+        A torch.nn.Module that represents the EMA of the trained model.
+    """
+    sys.path.append(os.path.expandvars(edm_lib_path))
+    with open(ckeckpoint_path, "rb") as fp:
+        ckpt = pickle.load(fp)
+    return ckpt["ema"]
+
+
+def load_retrained_model(
+    checkpoint_path: str, inference_config: InferenceConfig, sigma_data: float = 0.5
+):
+    """Loads a model retrained using the diffusion library."""
+    unet = SongUNet(
+        img_resolution=32,
+        in_channels=3,
+        out_channels=3,
+        label_dim=0,
+        augment_dim=9,
+        model_channels=128,
+        channel_mult=[2, 2, 2],
+        channel_mult_emb=4,
+        num_blocks=4,
+        attn_resolutions=[16],
+        dropout=0.13,
+        label_dropout=0,
+        embedding_type="fourier",
+        channel_mult_noise=2,
+        encoder_type="residual",
+        decoder_type="standard",
+        resample_filter=[1, 3, 3, 1],
+    )
+    model = KarrasDenoiser(model=unet, sigma_data=sigma_data)
+    return LightningDiffusion.load_from_checkpoint(
+        checkpoint_path, model=model, inference_config=inference_config
+    )
+
+
 @click.command()
 @click.option("--ckpt_path", help="Path to the model checkpoint.")
+@click.option(
+    "--ckpt_type",
+    type=click.Choice(["original", "retrained"]),
+    default="original",
+    help="Whether the checkpoint is origianl or retrained.",
+)
 @click.option("--output_dir", default="out", help="Output directory where images are saved.")
 @click.option("--n_samples", default=50000, help="Number of samples to generate.")
 @click.option("--n_steps", default=18, help="Number of denoising steps at inference time.")
@@ -62,19 +116,19 @@ def save_images(samples_batch, start_index: int, dir_path: str):
 @click.option(
     "--ode_type",
     type=click.Choice([*ODEType]),
-    default="karras_time",
+    default=ODEType.KARRAS,
     help="Type of the ODE to use for sampling.",
 )
 @click.option(
     "--solver_type",
     type=click.Choice([*SolverType]),
-    default="karras_heun2",
+    default=SolverType.KARRAS_HEUN2,
     help="Type of the solver to use for sampling.",
 )
 @click.option(
     "--noise_schedule_type",
     type=click.Choice([*NoiseScheduleType]),
-    default="karras",
+    default=NoiseScheduleType.KARRAS,
     help="Type of the noise schedule to use for sampling.",
 )
 @click.option("--mixed_precision", is_flag=True, default=False, help="Enable mixed precision.")
@@ -82,6 +136,7 @@ def save_images(samples_batch, start_index: int, dir_path: str):
 @click.option("--seed", default=42, help="Random seed.")
 def main(
     ckpt_path,
+    ckpt_type,
     output_dir,
     n_samples,
     n_steps,
@@ -106,12 +161,6 @@ def main(
         shuffle=False,
         num_workers=n_gpus,
     )
-
-    # Load pretrained model.
-    # TODO: add support for loading models trained in the playground.
-    denoiser = load_edm_model(ckpt_path, edm_lib_path=edm_lib_path)
-    if mixed_precision:
-        denoiser.use_fp16 = True
 
     # Select ODE.
     if ode_type == ODEType.KARRAS:
@@ -153,7 +202,16 @@ def main(
         n_steps=n_steps,
         return_trajectory=False,
     )
-    inference_model = LightningDiffusion(model=denoiser, inference_config=inference_config)
+
+    # Load pretrained model.
+    if ckpt_type == "original":
+        denoiser = load_edm_model(ckpt_path, edm_lib_path=edm_lib_path)
+        if mixed_precision:
+            denoiser.use_fp16 = True
+        inference_model = LightningDiffusion(model=denoiser, inference_config=inference_config)
+    elif ckpt_type == "retrained":
+        inference_model = load_retrained_model(ckpt_path, inference_config=inference_config)
+
     inference_runner = pl.Trainer(
         accelerator="gpu",
         devices=n_gpus,
