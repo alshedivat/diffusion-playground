@@ -304,7 +304,7 @@ class LightningDiffusion(pl.LightningModule):
         """Generates a batch of samples given a batch of noise."""
         del batch_idx, dataloader_idx  # Unused.
 
-        if "noise" not in batch_dict or len(batch_dict) == 1:
+        if "noise" not in batch_dict or len(batch_dict) != 1:
             raise ValueError(
                 f"`batch_dict` must contain only a single noise tensor, but got {batch_dict=}."
             )
