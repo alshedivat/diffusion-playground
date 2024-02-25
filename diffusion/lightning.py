@@ -1,6 +1,7 @@
 """PyTorch Lightning API for training and inference."""
 import copy
 import functools
+import logging
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -19,7 +20,27 @@ from diffusion.training import (
     ema_update,
 )
 
+# Setup logging.
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s %(levelname)s %(filename)s:%(lineno)d] %(message)s",
+    datefmt="%y/%m/%d %H:%M:%S",
+)
+logging.captureWarnings(True)
+logger = logging.getLogger(__name__)
+
+# Type aliases.
 Tensor = torch.Tensor
+
+
+# -----------------------------------------------------------------------------
+# Datasets and wrappers.
+# -----------------------------------------------------------------------------
+# Classes deined below are used to define a dataset of noise samples and wrap
+# other PyTorch datasets to include noise samples. The noise samples are used
+# for training and inference. The noise tensors are generated on-the-fly and
+# can be reused for each sample across epochs.
+# -----------------------------------------------------------------------------
 
 
 class StandardNormalNoiseDataset(torch.utils.data.Dataset):
@@ -81,6 +102,140 @@ class DiffusionDatasetWrapper(torch.utils.data.Dataset):
         return dict(**self.dataset[index], **self.noise_dataset[index])
 
 
+# -----------------------------------------------------------------------------
+# Callbacks.
+# -----------------------------------------------------------------------------
+# Various useful callbacks for training diffusion models.
+# -----------------------------------------------------------------------------
+
+
+class BatchNoisinessMonitor(pl.Callback):
+    """A callback that monitors batch noisiness and logs crical batch size.
+
+    The critical batch size is defined as the batch size that results in optimal computational
+    efficiency of training, as described in McCandlish et al. (2018). It can be approximately
+    computed using the simple estimate B_simple:
+        B_simple := tr(Sigma(grad L)) / ||grad L||^2,
+    where tr(Sigma(grad L)) is the trace of the covariance matrix of the gradients of the loos L.
+
+    Computing B_simple using the above formula requires per-sample gradients, computing which
+    adds overhead. Instead, we use an estimate that can be computed with no additional overhead
+    in the distributed training setting, as described in Appendix A.1 of the paper:
+        B_simple_hat := S / ||G||^2, where
+        S := (||G_small||^2 - ||G_big||^2) / (1/ B_small - 1 / B_big),
+        ||G||^2 := (B_big ||G_big||^2 - B_small ||G_small||^2) / (B_big - B_small),
+    where:
+        - B_small is the batch size used per device,
+        - B_big is effective batch size across all devices,
+        - ||G_small||^2 is the squared norm of the gradients computed using B_small,
+        - ||G_big||^2 is the squared norm of the gradients computed using B_big.
+
+    This callback essentially aggregates gradients before and after averaging them across all GPUs,
+    then smooths S and ||G||^2 estimates using exponential moving averages, and logs the estimated
+    critical batch size.
+
+    NOTE: This callback requires the model to be trained using DDP with multiple devices.
+          If the model is trained on a single GPU, the callback will log a warning and log NaNs.
+
+    Reference: https://arxiv.org/abs/1812.06162.
+    """
+
+    def __init__(self, ema_decay=0.9, eps=1e-5):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.eps = eps
+
+        # Placeholders.
+        self.batch_size_big = None
+        self.batch_size_small = None
+        self.no_gradient_sync_context = None
+
+        # EMA buffers.
+        self.s_ema = None
+        self.g2_ema = None
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.num_devices * trainer.num_nodes < 2:
+            logger.warning(
+                "Cannot estimate batch noisiness with a single device. "
+                "To estimate batch noisiness, runn DDP training with multiple devices."
+            )
+        else:
+            if trainer.is_global_zero:
+                logger.info("Disabling automatic gradient sync for computing B_simple estimates.")
+            # Enter no gradient sync context.
+            self.no_gradient_sync_context = trainer.strategy.block_backward_sync()
+            self.no_gradient_sync_context.__enter__()
+
+        # Initialize EMA buffers.
+        self.s_ema = torch.ones(1, device=pl_module.device)
+        self.g2_ema = torch.ones(1, device=pl_module.device)
+
+    def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        del trainer, pl_module  # Unused.
+        if self.no_gradient_sync_context is not None:
+            # Exit no gradient sync context.
+            self.no_gradient_sync_context.__exit__(None, None, None)
+            self.no_gradient_sync_context = None
+
+    def on_train_batch_start(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, batch: Any, batch_idx: int
+    ) -> None:
+        del pl_module, batch_idx  # Unused.
+        self.batch_size_small = batch["input"].shape[0]
+        self.batch_size_big = self.batch_size_small * trainer.num_devices * trainer.num_nodes
+
+    @torch.no_grad()
+    def on_after_backward(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+    ) -> None:
+        if trainer.num_devices * trainer.num_nodes < 2:
+            if trainer.is_global_zero:
+                pl_module.log("B_simple", float("nan"), on_step=True, on_epoch=True)
+            return
+
+        # Compute ||G_small||^2.
+        g2_small = 0.0
+        for param in pl_module.parameters():
+            if param.requires_grad:
+                # Compute g_small on each device separately.
+                g2_small += torch.sum(param.grad**2)
+        g2_small = trainer.strategy.reduce(g2_small, reduce_op="mean")
+
+        # Compute ||G_big||^2.
+        g2_big = 0.0
+        for param in pl_module.parameters():
+            if param.requires_grad:
+                # Manually sync gradients across devices.
+                param.grad = trainer.strategy.reduce(param.grad, reduce_op="mean")
+                # Compute g_big on each device separately.
+                g2_big += torch.sum(param.grad**2)
+        g2_big = trainer.strategy.reduce(g2_big, reduce_op="mean")
+
+        # Compute S, ||G||^2, and B_simple_hat.
+        if trainer.is_global_zero:
+            B_big = self.batch_size_big
+            B_small = self.batch_size_small
+            s = (g2_small - g2_big) / (1 / B_small - 1 / B_big)
+            g2 = (B_big * g2_big - B_small * g2_small) / (B_big - B_small)
+            # Update EMA.
+            self.s_ema = self.ema_decay * self.s_ema + (1 - self.ema_decay) * s
+            self.g2_ema = self.ema_decay * self.g2_ema + (1 - self.ema_decay) * g2
+            # Compute B_simple_hat.
+            B_simple_hat = self.s_ema / (self.g2_ema + self.eps)
+            logger.info(f"Estimated critical batch size: {B_simple_hat.item():.2f}")
+            self.log("B_simple", B_simple_hat, on_step=True)
+
+
+# -----------------------------------------------------------------------------
+# Configs.
+# -----------------------------------------------------------------------------
+# Dataclasses that contain configuration for training and inference.
+# -----------------------------------------------------------------------------
+
+
 @dataclass
 class TrainingConfig:
     """Configuration for training a denoising diffusion model.
@@ -139,6 +294,13 @@ class InferenceConfig:
     noise_schedule: BaseNoiseSchedule
     n_steps: int
     return_trajectory: bool = False
+
+
+# -----------------------------------------------------------------------------
+# Lightning module.
+# -----------------------------------------------------------------------------
+# A PyTorch Lightning module for denoising diffusion training and inference.
+# -----------------------------------------------------------------------------
 
 
 class LightningDiffusion(pl.LightningModule):

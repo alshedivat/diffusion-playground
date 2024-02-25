@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from diffusion.denoisers import KarrasDenoiser
 from diffusion.lightning import (
+    BatchNoisinessMonitor,
     DiffusionDatasetWrapper,
     LightningDiffusion,
     TrainingConfig,
@@ -159,7 +160,7 @@ def main(
         test_metric_prefix="test/",
         val_metric_prefix="val/",
     )
-    callback = pl.callbacks.ModelCheckpoint(
+    model_checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=ckpt_dir,
         monitor="val/loss",
         mode="min",
@@ -175,7 +176,10 @@ def main(
         gradient_clip_val=None,
         logger=aim_logger,
         log_every_n_steps=20,
-        callbacks=[callback],
+        callbacks=[
+            model_checkpoint_callback,
+            BatchNoisinessMonitor(),
+        ],
     )
     trainer.fit(diffusion, train_loader, test_loader)
 
